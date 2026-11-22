@@ -1,0 +1,4 @@
+# Copy to .sops.yaml next to your secrets file and put your gpg fingerprint in.
+creation_rules:
+  - path_regex: agent\.sops\.json$
+    pgp: REPLACE_WITH_YOUR_40_HEX_FINGERPRINT

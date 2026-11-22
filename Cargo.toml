@@ -1,0 +1,53 @@
+[package]
+name = "secret-broker"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Let AI agents use secrets through allowlisted commands without reading them"
+
+[dependencies]
+# AES-256-GCM with sops' 32-byte nonce (RustCrypto, audited).
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# SHA-512 for the sops MAC.
+sha2 = { version = "0.10", default-features = false }
+# ENC[...] fields are standard base64.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# Protocol + config + sops JSON; preserve_order keeps document order (the MAC depends on it).
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# Wipe key material and plaintext copies.
+zeroize = { version = "1", features = ["alloc"] }
+# mmap/mlock/madvise/prctl/setrlimit/SO_PEERCRED/getpwnam_r/kill.
+libc = "0.2"
+# sops encrypted_regex / unencrypted_regex (RE2 semantics, like Go's regexp).
+regex = { version = "1", default-features = false, features = ["std"] }
+
+[profile.release]
+# A panic should never happen (see [lints]); if one does anyway (OOM, a bug in
+# a dependency), abort instead of unwinding: no half-dropped state, and core
+# dumps are disabled so nothing is written to disk.
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[lints.clippy]
+# No runtime panics in non-test code. Test modules opt out explicitly.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+undocumented_unsafe_blocks = "deny"
