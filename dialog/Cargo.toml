@@ -1,0 +1,26 @@
+[package]
+name = "secret-broker-dialog"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Approval dialog for secret-broker: a Wayland layer-shell overlay, and a pinentry"
+
+[[bin]]
+name = "secret-broker-dialog"
+path = "src/main.rs"
+
+[dependencies]
+secret-broker = { path = ".." }
+# Wayland client + layer-shell + keyboard (xkbcommon), no toolkit. Pure-Rust
+# wire protocol (no libwayland); only libxkbcommon is linked.
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["xkbcommon"] }
+# Glyph rasterizer (no system font stack, no harfbuzz).
+fontdue = { version = "0.9", default-features = false, features = ["std", "simd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["alloc"] }
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -251,3 +251,83 @@ pub fn pid_alive(pid: i32) -> bool {
     let r = unsafe { libc::kill(pid, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
+
+/// Fill `buf` from the kernel CSPRNG (getrandom(2), blocking until seeded).
+pub fn random(buf: &mut [u8]) -> Result<()> {
+    let mut off = 0usize;
+    while off < buf.len() {
+        let rest = buf.get_mut(off..).unwrap_or(&mut []);
+        // SAFETY: `rest` is a valid writable buffer of rest.len() bytes.
+        let n = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::from(e).context("getrandom"));
+        }
+        off = off.saturating_add(usize::try_from(n).unwrap_or(0));
+    }
+    Ok(())
+}
+
+/// Login name of a uid from the passwd database.
+pub fn name_of(uid: u32) -> Result<String> {
+    let mut pwd: libc::passwd = {
+        // SAFETY: passwd is a plain C struct; all-zero is a valid (empty) value.
+        unsafe { std::mem::zeroed() }
+    };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call; buf outlives the call.
+    let r = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if r != 0 || result.is_null() || pwd.pw_name.is_null() {
+        bail!("no passwd entry for uid {uid}");
+    }
+    // SAFETY: pw_name points into `buf`, NUL-terminated by libc.
+    let name = unsafe { CStr::from_ptr(pwd.pw_name) };
+    Ok(name.to_string_lossy().into_owned())
+}
+
+/// Restores the terminal mode saved by [`no_echo`] when dropped.
+pub struct EchoGuard {
+    fd: RawFd,
+    saved: libc::termios,
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: fd is the terminal we read the settings from; saved is valid.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
+        }
+    }
+}
+
+/// Turn off echo on terminal `fd` (keeps canonical line editing).
+pub fn no_echo(fd: RawFd) -> Result<EchoGuard> {
+    let mut t: libc::termios = {
+        // SAFETY: termios is a plain C struct; zeroed is a valid value to fill.
+        unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: t is a valid termios out-pointer.
+    if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+        return Err(last_os_error("tcgetattr"));
+    }
+    let saved = t;
+    t.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    t.c_lflag |= libc::ICANON;
+    // SAFETY: as above.
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &t) } != 0 {
+        return Err(last_os_error("tcsetattr"));
+    }
+    Ok(EchoGuard { fd, saved })
+}

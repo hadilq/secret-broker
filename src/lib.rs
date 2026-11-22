@@ -5,12 +5,14 @@
 //! (unwrap/expect/panic/indexing/slicing/arithmetic... are denied) and the
 //! `clippy` flake check, which fails the build on any violation.
 
+pub mod approve;
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod gpgcache;
 pub mod policy;
 pub mod proto;
+pub mod pin;
 pub mod redact;
 pub mod sandbox;
 pub mod secmem;

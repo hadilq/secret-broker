@@ -3,6 +3,22 @@ let
   cfg = config.programs.secret-broker;
   inherit (lib) mkOption mkEnableOption mkIf types;
   defaultSocket = "/run/secret-broker/broker.sock";
+  dcfg = cfg.dialog;
+
+  fontArgs = lib.escapeShellArgs (
+    [ "--font" "${dcfg.font}" ]
+    ++ lib.optionals (dcfg.fontBold != null) [ "--font-bold" "${dcfg.fontBold}" ]
+    ++ lib.optionals (dcfg.theme != null) [ "--theme" "${dcfg.theme}" ]
+  );
+
+  # gpg-agent's pinentry: the same dialog; pinentry-curses when there is no
+  # Wayland display (tty login, ssh).
+  dialogPinentry = pkgs.writeShellScriptBin "pinentry-secret-broker" ''
+    exec ${dcfg.package}/bin/secret-broker-dialog pinentry \
+      --fallback ${pkgs.pinentry-curses}/bin/pinentry-curses ${fontArgs} "$@"
+  '';
+
+  jbm = "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts/truetype/NerdFonts/JetBrainsMono";
 in
 {
   imports = [ ./ai-run-hm.nix ];
@@ -45,8 +61,52 @@ in
       };
       pinentryPackage = mkOption {
         type = types.package;
-        default = pkgs.pinentry-qt;
+        default = if dcfg.enable && dcfg.pinentry then dialogPinentry else pkgs.pinentry-qt;
+        defaultText = lib.literalExpression "the secret-broker dialog's pinentry if dialog.pinentry, else pkgs.pinentry-qt";
         description = "pinentry used when `recommended` is on.";
+      };
+    };
+
+    dialog = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Run the approval dialog (`secret-broker-dialog prompter`) as a
+          systemd user service in the graphical session. When the session is
+          sealed and an agent runs `secret-run`, it shows a Wayland overlay
+          (layer-shell, exclusive keyboard) with who is asking and what will
+          run; you approve with your PIN, a security-key touch or a finger.
+          It only collects input: the broker verifies everything. It runs from
+          systemd, never inside ai-run, and the broker refuses dialogs from
+          sandboxes.
+        '';
+      };
+      package = mkOption {
+        type = types.package;
+        default = pkgs.callPackage ./dialog.nix { };
+      };
+      pinentry = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Use the same dialog as gpg-agent's pinentry (with `gpgAgent.recommended`),
+          i.e. for the one gpg passphrase prompt after boot.
+        '';
+      };
+      font = mkOption {
+        type = types.path;
+        default = "${jbm}/JetBrainsMonoNerdFont-Regular.ttf";
+        defaultText = lib.literalExpression "JetBrainsMono Nerd Font Regular (Omarchy's UI font)";
+      };
+      fontBold = mkOption {
+        type = types.nullOr types.path;
+        default = "${jbm}/JetBrainsMonoNerdFont-Bold.ttf";
+      };
+      theme = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = "colors.toml to use; null follows the current Omarchy theme.";
       };
     };
   };
@@ -56,6 +116,25 @@ in
       home.packages = [ cfg.package ];
       home.sessionVariables = mkIf (cfg.socket != defaultSocket) { SECRET_BROKER_SOCKET = cfg.socket; };
     }
+    (mkIf dcfg.enable {
+      home.packages = [ dcfg.package ];
+      systemd.user.services.secret-broker-dialog = {
+        Unit = {
+          Description = "secret-broker approval dialog";
+          PartOf = [ "graphical-session.target" ];
+          After = [ "graphical-session.target" ];
+        };
+        Service = {
+          ExecStart = "${dcfg.package}/bin/secret-broker-dialog prompter ${fontArgs}";
+          Restart = "always";
+          RestartSec = 3;
+          LimitCORE = 0;
+          NoNewPrivileges = true;
+          Environment = lib.optional (cfg.socket != defaultSocket) "SECRET_BROKER_SOCKET=${cfg.socket}";
+        };
+        Install.WantedBy = [ "graphical-session.target" ];
+      };
+    })
     (mkIf cfg.gpgAgent.recommended {
       services.gpg-agent = {
         defaultCacheTtl = lib.mkOverride 90 cfg.gpgAgent.cacheTtl;

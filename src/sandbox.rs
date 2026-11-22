@@ -30,6 +30,8 @@ pub struct Config {
     pub env_unset: Vec<String>,
     /// Environment variables removed unless the profile keeps them (globs).
     pub env_deny: Vec<String>,
+    /// Environment variables set in every profile (a profile's `env` wins).
+    pub env: BTreeMap<String, String>,
     pub profiles: BTreeMap<String, Profile>,
 }
 
@@ -370,8 +372,19 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         })
         .cloned()
         .collect();
-    env.retain(|(k, _)| !prof.env.contains_key(k) && k != "AI_RUN_PROFILE" && k != "AI_RUN_CONFIG");
+    env.retain(|(k, _)| {
+        !prof.env.contains_key(k)
+            && !cfg.env.contains_key(k)
+            && k != "AI_RUN_PROFILE"
+            && k != "AI_RUN_CONFIG"
+    });
     env.append(&mut p.env);
+    env.extend(
+        cfg.env
+            .iter()
+            .filter(|(k, _)| !prof.env.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
     env.extend(prof.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.push(("AI_RUN_PROFILE".into(), name.to_string()));
     if !prof.path_prefix.is_empty() {
@@ -427,7 +440,8 @@ mod tests {
             "writable": ["dev", ".cache", "Absent"],
             "read_only": ["dev/hm/.git/hooks"],
             "env_unset": ["DISPLAY"],
-            "env_deny": ["*TOKEN*", "AWS_*"],
+            "env_deny": ["*TOKEN*", "AWS_*", "*SECRET*"],
+            "env": {"SECRET_BROKER_SOCKET": "/run/secret-broker/agent.sock", "SHELL": "/global"},
             "profiles": {
               "default": {},
               "bot": {
@@ -547,6 +561,13 @@ mod tests {
         }
         assert!(names.contains(&"TERM") && names.contains(&"PATH"));
         assert!(p.env.contains(&("AI_RUN_PROFILE".into(), "default".into())));
+        // global env is set even though it matches env_deny
+        assert!(p.env.contains(&(
+            "SECRET_BROKER_SOCKET".into(),
+            "/run/secret-broker/agent.sock".into()
+        )));
+        assert_eq!(names.iter().filter(|n| **n == "SHELL").count(), 1);
+        assert!(p.env.contains(&("SHELL".into(), "/global".into())));
     }
 
     #[test]
@@ -585,6 +606,9 @@ mod tests {
             &["--ro-bind", &sock.to_string_lossy(), "/run/user/1000/bus"]
         ));
         let get = |k: &str| p.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        // a profile's env wins over the global env
+        assert_eq!(get("SHELL").as_deref(), Some("/nix/store/w/zsh"));
+        assert_eq!(p.env.iter().filter(|(n, _)| n == "SHELL").count(), 1);
         assert_eq!(
             get("DBUS_SESSION_BUS_ADDRESS").unwrap(),
             "unix:path=/run/user/1000/bus"

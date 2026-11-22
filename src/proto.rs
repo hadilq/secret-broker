@@ -15,12 +15,14 @@ pub const T_STDIN_EOF: u8 = b'i'; // stdin closed (client -> broker)
 pub const T_STDOUT: u8 = b'O'; // child stdout (broker -> client)
 pub const T_STDERR: u8 = b'E'; // child stderr (broker -> client)
 pub const T_EXIT: u8 = b'X'; // child finished, JSON ExitInfo
+pub const T_PIN: u8 = b'P'; // quick-approval PIN (client/prompter -> broker)
 
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Request {
-    pub op: String, // status | lock | unlock | exec
+    /// status | lock | unlock | exec | approve | set_pin | prompter
+    pub op: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -29,6 +31,13 @@ pub struct Request {
     pub args: Vec<String>,
     #[serde(default)]
     pub stdin: bool,
+    /// lock: wipe the secrets from memory instead of sealing them.
+    /// set_pin: remove the PIN.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forget: bool,
+    /// set_pin: anti-phishing phrase shown in every genuine dialog.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phrase: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -71,6 +80,27 @@ pub struct Status {
     pub gpg_cache_limits: GpgCacheLimits,
     #[serde(default)]
     pub profiles: Vec<ProfileInfo>,
+    /// cold (nothing in memory: needs gpg) | sealed (in memory, needs a
+    /// quick approval) | open
+    #[serde(default)]
+    pub state: String,
+    /// Configured quick-approval methods ("pin", "fido2", PAM method names).
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// An approval dialog (prompter) is connected.
+    #[serde(default)]
+    pub prompter: bool,
+    #[serde(default)]
+    pub pin_set: bool,
+    #[serde(default)]
+    pub pin_locked_out: bool,
+    #[serde(default)]
+    pub pin_attempts_left: u32,
+    /// This connection came through the restricted (sandbox) socket.
+    #[serde(default)]
+    pub restricted: bool,
+    #[serde(default)]
+    pub approval_timeout_seconds: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -90,6 +120,58 @@ impl Response {
             status: None,
         }
     }
+}
+
+/// Who asked for the session (filled by the broker from SO_PEERCRED and the
+/// socket the request came in on; the dialog may add /proc details itself).
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct Requester {
+    pub pid: i32,
+    pub uid: u32,
+    #[serde(default)]
+    pub user: String,
+    /// Came through the restricted socket (from inside ai-run).
+    #[serde(default)]
+    pub sandboxed: bool,
+}
+
+/// Broker -> approval dialog (prompter) or `secret-broker unlock`.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct Prompt {
+    /// request | update | done
+    pub kind: String,
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Requester>,
+    /// What will run, e.g. "secret-run gh pr list".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
+    #[serde(default)]
+    pub ttl_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// Human labels for hardware methods ("Touch your security key", ...).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<String>,
+    /// Anti-phishing phrase chosen with `secret-broker set-pin`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phrase: String,
+    #[serde(default)]
+    pub attempts_left: u32,
+    #[serde(default)]
+    pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(default)]
+    pub ok: bool,
+}
+
+/// Approval dialog -> broker. kind "pin" is followed by a T_PIN frame.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct Answer {
+    /// pin | deny
+    pub kind: String,
+    pub id: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

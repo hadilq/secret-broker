@@ -36,6 +36,116 @@ pub struct Config {
     pub redact_output: bool,
     pub gpg_cache_limits: GpgCacheLimits,
     pub profiles: BTreeMap<String, Profile>,
+    pub approval: Approval,
+}
+
+/// Quick approval of a sealed session (secrets already in memory).
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct Approval {
+    /// How long a dialog waits for the user.
+    pub timeout_seconds: u64,
+    /// Forget (wipe) sealed secrets after this long; 0 = keep until reboot
+    /// or `secret-broker lock --forget`.
+    pub sealed_max_seconds: u64,
+    pub pin: PinConfig,
+    pub fido2: Fido2Config,
+    /// Extra PAM-based methods (fingerprint, ...), checked in a helper process.
+    pub pam: Vec<PamMethod>,
+}
+
+impl Default for Approval {
+    fn default() -> Self {
+        Approval {
+            timeout_seconds: 120,
+            sealed_max_seconds: 0,
+            pin: PinConfig::default(),
+            fido2: Fido2Config::default(),
+            pam: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct PinConfig {
+    pub enable: bool,
+    pub min_length: usize,
+    /// Wrong PINs before the secrets are wiped from memory (back to gpg).
+    pub max_attempts: u32,
+    pub argon2_memory_kib: u32,
+    pub argon2_iterations: u32,
+    pub argon2_parallelism: u32,
+}
+
+impl Default for PinConfig {
+    fn default() -> Self {
+        let c = crate::pin::Cost::default();
+        PinConfig {
+            enable: true,
+            min_length: 6,
+            max_attempts: 5,
+            argon2_memory_kib: c.m_kib,
+            argon2_iterations: c.t,
+            argon2_parallelism: c.p,
+        }
+    }
+}
+
+impl PinConfig {
+    pub fn cost(&self) -> crate::pin::Cost {
+        crate::pin::Cost {
+            m_kib: self.argon2_memory_kib,
+            t: self.argon2_iterations,
+            p: self.argon2_parallelism,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct Fido2Config {
+    /// Relying party id the credentials were made for.
+    pub rp_id: String,
+    /// Directory holding fido2-token and fido2-assert (libfido2 tools).
+    pub tools_dir: String,
+    pub credentials: Vec<Fido2Credential>,
+}
+
+impl Default for Fido2Config {
+    fn default() -> Self {
+        Fido2Config {
+            rp_id: "secret-broker".into(),
+            tools_dir: String::new(),
+            credentials: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct Fido2Credential {
+    pub name: String,
+    /// Base64 credential id from `secret-broker fido2-enroll`.
+    pub id: String,
+    /// PEM public key file.
+    pub public_key_file: String,
+    /// es256 | rs256 | eddsa
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct PamMethod {
+    /// Method name shown in status, e.g. "fingerprint".
+    pub name: String,
+    /// /etc/pam.d service to authenticate against.
+    pub service: String,
+    /// Hint shown in the dialog, e.g. "Touch the fingerprint sensor".
+    pub label: String,
+    /// Attempts per approval.
+    pub retries: u32,
 }
 
 impl Default for Config {
@@ -52,6 +162,7 @@ impl Default for Config {
                 max_cache_ttl: 7200,
             },
             profiles: BTreeMap::new(),
+            approval: Approval::default(),
         }
     }
 }
@@ -95,6 +206,44 @@ pub fn load(path: &str) -> Result<Config> {
             if !valid_env(k) {
                 bail!("profile {name}: invalid env var name {k:?}");
             }
+        }
+    }
+    let a = &mut c.approval;
+    if a.timeout_seconds == 0 {
+        a.timeout_seconds = 120;
+    }
+    if a.pin.max_attempts == 0 {
+        a.pin.max_attempts = 5;
+    }
+    if a.fido2.rp_id.is_empty() {
+        a.fido2.rp_id = "secret-broker".into();
+    }
+    if !a.fido2.credentials.is_empty() && !a.fido2.tools_dir.starts_with('/') {
+        bail!("approval.fido2.tools_dir must be an absolute path");
+    }
+    for cred in &mut a.fido2.credentials {
+        if cred.kind.is_empty() {
+            cred.kind = "es256".into();
+        }
+        if !matches!(cred.kind.as_str(), "es256" | "rs256" | "eddsa") {
+            bail!("fido2 credential {}: unknown type {:?}", cred.name, cred.kind);
+        }
+        if cred.id.is_empty() || !cred.public_key_file.starts_with('/') {
+            bail!("fido2 credential {}: needs id and an absolute public_key_file", cred.name);
+        }
+    }
+    for m in &mut a.pam {
+        if !valid_name(&m.name) || matches!(m.name.as_str(), "pin" | "fido2") {
+            bail!("invalid PAM method name {:?}", m.name);
+        }
+        if !valid_name(&m.service) {
+            bail!("PAM method {}: invalid service {:?}", m.name, m.service);
+        }
+        if m.retries == 0 {
+            m.retries = 3;
+        }
+        if m.label.is_empty() {
+            m.label = format!("Authenticate with {}", m.name);
         }
     }
     Ok(c)

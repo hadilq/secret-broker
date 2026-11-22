@@ -1,0 +1,182 @@
+//! secret-broker-dialog: the approval dialog for secret-broker.
+//!
+//! - `prompter` (default): runs in your graphical session (systemd user
+//!   service), registers with the broker as its approval dialog, and shows a
+//!   layer-shell overlay for each request. It only collects input; the
+//!   broker verifies the PIN / security key / fingerprint itself.
+//! - `pinentry`: a gpg pinentry with the same look (first unlock after boot).
+//! - `demo`: render a sample dialog (to a PPM file, or in a window).
+
+mod pinentry;
+mod procinfo;
+mod prompter;
+mod render;
+mod theme;
+mod ui;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+const USAGE: &str = "usage:
+  secret-broker-dialog [prompter] [--font FILE] [--font-bold FILE] [--theme colors.toml]
+  secret-broker-dialog pinentry [--fallback /path/to/pinentry-curses] [--font FILE] ...
+  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--window]
+";
+
+#[derive(Debug, Default)]
+pub struct Opts {
+    pub font: Option<PathBuf>,
+    pub font_bold: Option<PathBuf>,
+    pub theme: Option<PathBuf>,
+    pub fallback: Option<String>,
+}
+
+fn fc_match(pattern: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("fc-match")
+        .args(["--format=%{file}", pattern])
+        .output()
+        .ok()?;
+    let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    p.is_file().then_some(p)
+}
+
+pub fn load_fonts(o: &Opts) -> Result<render::Fonts, String> {
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let regular = o
+        .font
+        .clone()
+        .or_else(|| env("SECRET_BROKER_DIALOG_FONT"))
+        .or_else(|| fc_match("sans:style=Regular"))
+        .ok_or("no font: pass --font FILE")?;
+    let bold = o
+        .font_bold
+        .clone()
+        .or_else(|| env("SECRET_BROKER_DIALOG_FONT_BOLD"))
+        .or_else(|| fc_match("sans:style=Bold"));
+    let r = std::fs::read(&regular).map_err(|e| format!("{}: {e}", regular.display()))?;
+    let b = bold.and_then(|p| std::fs::read(p).ok());
+    render::Fonts::load(&r, b.as_deref())
+}
+
+fn demo_prompt() -> secret_broker::proto::Prompt {
+    secret_broker::proto::Prompt {
+        kind: "request".into(),
+        id: 1,
+        requester: Some(secret_broker::proto::Requester {
+            pid: i32::try_from(std::process::id()).unwrap_or(0),
+            uid: secret_broker::sys::getuid(),
+            user: secret_broker::sys::name_of(secret_broker::sys::getuid()).unwrap_or_default(),
+            sandboxed: true,
+        }),
+        purpose: "secret-run gh pr list --repo hadilq/secret-broker".into(),
+        ttl_seconds: 8 * 3600,
+        methods: vec!["pin".into(), "fido2".into()],
+        hints: vec!["Touch your security key".into()],
+        phrase: "blue otter".into(),
+        attempts_left: 5,
+        timeout_seconds: 120,
+        ..Default::default()
+    }
+}
+
+fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
+    let mut out = PathBuf::from("secret-broker-dialog.ppm");
+    let mut scale = 1i32;
+    let mut window = false;
+    let mut pin_mode = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().map(PathBuf::from).ok_or("--out FILE")?,
+            "--scale" => scale = it.next().and_then(|v| v.parse().ok()).ok_or("--scale N")?,
+            "--window" => window = true,
+            "--pinentry" => pin_mode = true,
+            _ => {}
+        }
+    }
+    let view = if pin_mode {
+        ui::View {
+            title: "Unlock OpenPGP key".into(),
+            body: "Please enter the passphrase to unlock the OpenPGP secret key:\n\"Hadi <hadi@example.com>\"\n255-bit EDDSA key, ID 0123456789ABCDEF".into(),
+            field: Some("Passphrase".into()),
+            footer: "Enter  OK      Esc  cancel".into(),
+            ..Default::default()
+        }
+    } else {
+        let mut v = prompter::view_for(&demo_prompt());
+        v.message = Some(("Wrong PIN, 4 attempts left".into(), ui::Tone::Error));
+        v
+    };
+    let fonts = load_fonts(o)?;
+    let theme = theme::load(o.theme.as_deref());
+    if window {
+        let mut u = ui::Ui::open(theme, fonts)?;
+        u.set_view(view);
+        loop {
+            match u.wait(None)? {
+                ui::UiEvent::Submit(s) => {
+                    println!("submitted {} chars", s.chars().count());
+                    return Ok(());
+                }
+                ui::UiEvent::Cancel | ui::UiEvent::Closed => {
+                    println!("cancelled");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+    let (w, h, rgba) = ui::Ui::render_offscreen(theme, fonts, view, 6, scale);
+    // PPM over the theme's dark background (alpha composited).
+    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+    for px in rgba.chunks_exact(4) {
+        if let [b, g, r, a] = px {
+            let inv = 255u16.saturating_sub(u16::from(*a));
+            let bg = |c: u8, base: u16| {
+                let v = u16::from(c).saturating_add(base.saturating_mul(inv) / 255);
+                u8::try_from(v.min(255)).unwrap_or(255)
+            };
+            ppm.extend_from_slice(&[bg(*r, 0x10), bg(*g, 0x10), bg(*b, 0x10)]);
+        }
+    }
+    std::fs::write(&out, ppm).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("wrote {} ({w}x{h})", out.display());
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let _ = secret_broker::sys::set_non_dumpable();
+    let _ = secret_broker::sys::disable_core_dumps();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mode, rest) = match args.first().map(String::as_str) {
+        Some(m @ ("prompter" | "pinentry" | "demo")) => (m.to_string(), args.get(1..).unwrap_or(&[]).to_vec()),
+        Some("-h" | "--help" | "help") => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => ("prompter".to_string(), args.clone()),
+    };
+    let mut o = Opts::default();
+    let mut passthrough = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--font" => o.font = it.next().map(PathBuf::from),
+            "--font-bold" => o.font_bold = it.next().map(PathBuf::from),
+            "--theme" => o.theme = it.next().map(PathBuf::from),
+            "--fallback" => o.fallback = it.next().cloned(),
+            other => passthrough.push(other.to_string()),
+        }
+    }
+    match mode.as_str() {
+        "pinentry" => pinentry::run(&o, &passthrough),
+        "demo" => match demo(&o, &passthrough) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("secret-broker-dialog: {e}");
+                ExitCode::from(1)
+            }
+        },
+        _ => prompter::run(&o),
+    }
+}

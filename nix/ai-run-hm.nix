@@ -80,6 +80,7 @@ let
     read_only = cfg.readOnly;
     env_unset = cfg.envUnset;
     env_deny = cfg.envDeny;
+    inherit (cfg) env;
     profiles = lib.mapAttrs (_: toJsonProfile) cfg.profiles;
   });
 
@@ -219,6 +220,9 @@ in
         ".cache/nix"
         # root-equivalent or session-wide sockets outside $XDG_RUNTIME_DIR
         "/run/docker.sock" "/run/podman" "/run/libvirt" "/run/dbus/system_bus_socket" "/run/pcscd"
+        # secret-broker's full socket (unlock, approve, PIN, dialog); sandboxes
+        # use the restricted socket instead (see `env`)
+        "/run/secret-broker/broker.sock"
       ];
     };
     extraMask = mkOption { type = types.listOf types.str; default = [ ]; };
@@ -250,6 +254,18 @@ in
         "HYPRLAND_INSTANCE_SIGNATURE" "SWAYSOCK" "NIRI_SOCKET" "TMUX" "TMUX_PANE"
         "ALACRITTY_SOCKET" "KITTY_LISTEN_ON" "DOCKER_HOST" "CONTAINER_HOST"
       ];
+    };
+    env = mkOption {
+      type = types.attrsOf types.str;
+      default = {
+        SECRET_BROKER_SOCKET = "/run/secret-broker/agent.sock";
+      };
+      description = ''
+        Variables set in every profile (a profile's own `env` wins). The
+        default points secret-run at the broker's restricted socket, which
+        can run profiles (popping up the approval dialog when the session is
+        sealed) but can't unlock, approve or set the PIN.
+      '';
     };
     envDeny = mkOption {
       type = types.listOf types.str;

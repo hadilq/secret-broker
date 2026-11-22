@@ -22,6 +22,8 @@ zeroize = { version = "1", features = ["alloc"] }
 libc = "0.2"
 # sops encrypted_regex / unencrypted_regex (RE2 semantics, like Go's regexp).
 regex = { version = "1", default-features = false, features = ["std"] }
+# PIN hashing (memory-hard KDF) for quick approval.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 
 [profile.release]
 # A panic should never happen (see [lints]); if one does anyway (OOM, a bug in
@@ -31,11 +33,17 @@ panic = "abort"
 lto = true
 codegen-units = 1
 
-[lints.rust]
+[workspace]
+members = [".", "dialog"]
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "allow"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # No runtime panics in non-test code. Test modules opt out explicitly.
 unwrap_used = "deny"
 expect_used = "deny"

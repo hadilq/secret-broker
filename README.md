@@ -183,8 +183,9 @@ terminal). If a profile runs a JIT runtime (node, java), set
 inputs.secret-broker.url = "...";
 # modules = [ secret-broker.homeManagerModules.default ];
 programs.secret-broker.enable = true;
-# optional: short gpg cache + pinentry-qt
+# optional: short gpg cache + the secret-broker dialog as pinentry
 # programs.secret-broker.gpgAgent.recommended = true;
+# programs.secret-broker.dialog.enable = true;   # default; approval dialog user service
 ```
 
 ### The secrets file
@@ -206,11 +207,103 @@ Shamir threshold > 1 aren't supported.
 secret-broker unlock --ttl 8h   # pinentry once; session lasts 8h (capped by maxTtl)
 secret-broker status            # state, expiry, profiles, allow rules (never values)
 secret-run gh pr list           # agent-facing; exit code is the child's
-secret-broker lock              # wipe now (bind it to your screen locker)
+secret-broker lock              # seal (PIN/key to reopen); --forget wipes
+secret-broker set-pin           # quick approval PIN (see below)
 ```
 
 Exit codes: the child's own, `126` refused (locked / not allowlisted /
 unknown profile), `125` broker unreachable or protocol error.
+
+## Sessions: gpg once, then a PIN / security key / fingerprint
+
+```
+cold ──gpg unlock──▶ open ──ttl / lock──▶ sealed ──quick approval──▶ open
+  ▲                                        │
+  └──── lock --forget / restart / lockout / sealedTimeout ────┘
+```
+
+* **cold**: nothing in RAM. Only `secret-broker unlock` (gpg, via pinentry) helps.
+* **open**: `secret-run` works until the TTL.
+* **sealed**: the decrypted values stay in the broker's mlocked memory, but
+  `secret-run` needs a quick approval first. If no quick method is configured,
+  TTL expiry and `lock` go straight to cold (the old behaviour).
+  `lock --forget` always wipes. `approval.sealedTimeout` (NixOS) wipes a sealed
+  session after N seconds (0 = never).
+
+Quick methods, all **checked by the broker**. The dialog only collects input
+and shows the request.
+
+| method | how it's verified | default |
+|---|---|---|
+| PIN | argon2id(pin, salt, secret = HMAC(data key)) in `/var/lib/secret-broker/auth/pin`; backoff 1,2,4…60 s; after `maxAttempts` (5) wrong PINs the secrets are wiped and gpg is needed again | on (once you `set-pin`) |
+| FIDO2 key (YubiKey) | broker runs `fido2-assert` with a fresh challenge bound to the request id and purpose, then verifies the signature against the enrolled public key (user presence = touch) | off until a credential is configured |
+| fingerprint | PAM service `secret-broker-fingerprint` (fprintd) run in a helper process | off |
+| any PAM | `approval.pam.<name>` | none |
+
+The PIN file is useless without the data key (it's peppered with a key derived
+from it), so offline brute force needs the sops data key anyway. The PIN only
+works while the session is **sealed**, never from cold.
+
+### Setting a PIN / enrolling a security key
+
+```sh
+secret-broker unlock                 # gpg once after boot
+secret-broker set-pin                # PIN twice + an anti-phishing phrase, then gpg again
+secret-broker set-pin --remove
+secret-broker fido2-enroll --name yubikey      # touch; prints a NixOS snippet:
+#   services.secret-broker.approval.fido2.credentials = [{ name = "yubikey"; id = "…"; publicKey = ./yubikey.pub; }];
+```
+
+`set-pin` and `fido2-enroll` are refused on the sandbox socket.
+
+### The dialog (`secret-broker-dialog`)
+
+A ~1.2 MB Wayland layer-shell client (smithay-client-toolkit + fontdue,
+software rendering into wl_shm, links only libxkbcommon and libc). It works on
+any compositor with `wlr-layer-shell` (Hyprland, sway, river, niri, KDE…):
+an overlay layer surface with **exclusive keyboard**, centred, and no pointer
+input, so a click can't approve. It shows who asked (command, pid, parent chain,
+whether it runs inside ai-run), what will run, how long it opens for, your
+phrase, a PIN field, and hints for a key touch or fingerprint. It's themed from
+`~/.local/state/omarchy/current/theme/colors.toml`.
+
+Why not iced/GTK/Qt: on this nixpkgs, pinentry-qt's closure is ~753 MiB and
+pinentry-gnome3's ~365 MiB. iced needs wgpu/tiny-skia + winit, so it's a few
+MB of binary and still has no layer-shell or exclusive-keyboard support
+without forks. The dialog has three modes:
+
+* `prompter` (systemd user service): registers with the broker, shows approvals.
+* `pinentry`: an Assuan pinentry, so the gpg unlock uses the same window
+  (`pinentry-secret-broker`, which falls back to pinentry-curses without Wayland).
+* `demo [--window]`: renders a sample.
+
+Without a running dialog, `secret-broker unlock` on a terminal asks for the PIN
+there (or the key touch). Inside ai-run the socket is restricted: no
+unlock/approve/set-pin/prompter.
+
+### Sandbox socket
+
+The broker listens on two sockets: `broker.sock` (full) and `agent.sock`
+(restricted). ai-run masks `broker.sock` and sets
+`SECRET_BROKER_SOCKET=/run/secret-broker/agent.sock`, so a sandboxed agent
+can run `secret-run` (which then waits for your approval) but can't register
+a fake dialog, answer approvals, or change the PIN.
+
+### Residual risks of the quick path
+
+* The PIN is typed into a process running as you. Anything unsandboxed as you
+  could draw a fake overlay or register its own prompter (the last registration
+  wins). The phrase you chose at `set-pin` is the tell: no phrase, no PIN.
+  The FIDO2 touch doesn't have this problem (the key signs the broker's challenge).
+* Unsandboxed code as you can also edit the user service / environment of the
+  dialog. Keep agents in ai-run.
+* Requester info comes from `/proc` and can be stale if a pid is reused. It's
+  advisory, and you can still approve blind.
+* `agent-secrets` children can read the PIN file. It's peppered with the data
+  key, so this is only an offline attack for someone who already has the key.
+* Hyprland (optional): `ecosystem:enforce_permissions` with a screencopy deny
+  for agents, and `layerrule = noscreenshare, secret-broker`, keep the dialog
+  out of screenshots. This isn't enabled; check it against your Hyprland version.
 
 ## ai-run: sandbox the agent, not just the secrets
 

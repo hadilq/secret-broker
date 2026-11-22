@@ -15,10 +15,14 @@
     {
       packages = forAll (pkgs: rec {
         secret-broker = pkgs.callPackage ./nix/package.nix { };
+        secret-broker-dialog = pkgs.callPackage ./nix/dialog.nix { };
         default = secret-broker;
       });
 
-      overlays.default = final: _prev: { secret-broker = final.callPackage ./nix/package.nix { }; };
+      overlays.default = final: _prev: {
+        secret-broker = final.callPackage ./nix/package.nix { };
+        secret-broker-dialog = final.callPackage ./nix/dialog.nix { };
+      };
 
       nixosModules.default = ./nix/nixos-module.nix;
       nixosModules.secret-broker = ./nix/nixos-module.nix;
@@ -27,6 +31,7 @@
 
       checks = forAll (pkgs: {
         package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        dialog = self.packages.${pkgs.stdenv.hostPlatform.system}.secret-broker-dialog;
         clippy = pkgs.callPackage ./nix/clippy.nix {
           secret-broker = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
@@ -35,7 +40,7 @@
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer sops gnupg age jq ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer sops gnupg age jq pkg-config libxkbcommon linux-pam libfido2 ];
         };
       });
 

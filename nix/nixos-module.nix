@@ -66,6 +66,71 @@ let
 
   enabledProfiles = lib.filterAttrs (_: p: p.enable) cfg.profiles;
 
+  acfg = cfg.approval;
+
+  fido2CredModule = { ... }: {
+    options = {
+      name = mkOption {
+        type = types.strMatching "[A-Za-z0-9][A-Za-z0-9_.-]*";
+        description = "A label for this key.";
+      };
+      id = mkOption {
+        type = types.str;
+        description = "Base64 credential id printed by `secret-broker fido2-enroll`.";
+      };
+      publicKey = mkOption {
+        type = types.str;
+        description = "PEM public key printed by `secret-broker fido2-enroll` (public data).";
+      };
+      type = mkOption {
+        type = types.enum [ "es256" "rs256" "eddsa" ];
+        default = "es256";
+      };
+    };
+  };
+
+  pamMethodModule = { name, ... }: {
+    options = {
+      service = mkOption {
+        type = types.str;
+        default = "secret-broker-${name}";
+        description = "PAM service (/etc/pam.d/<service>) to authenticate the approving user against.";
+      };
+      label = mkOption {
+        type = types.str;
+        default = "Authenticate with ${name}";
+        description = "Hint shown in the approval dialog.";
+      };
+      retries = mkOption {
+        type = types.ints.positive;
+        default = 3;
+      };
+      text = mkOption {
+        type = types.nullOr types.lines;
+        default = null;
+        description = ''
+          If set, the PAM service file content. Only non-interactive modules
+          work: the helper refuses every prompt, so a password module can
+          never be used here.
+        '';
+      };
+    };
+  };
+
+  fingerprintMethod = {
+    service = "secret-broker-fingerprint";
+    label = acfg.fingerprint.label;
+    retries = acfg.fingerprint.retries;
+    text = ''
+      auth    required ${acfg.fingerprint.package}/lib/security/pam_fprintd.so max-tries=1 timeout=${toString acfg.fingerprint.timeout}
+      account required pam_permit.so
+    '';
+  };
+
+  pamMethods = acfg.pam // lib.optionalAttrs acfg.fingerprint.enable { fingerprint = fingerprintMethod; };
+
+  fido2Enabled = acfg.fido2.credentials != [ ];
+
   configFile = pkgs.writeText "secret-broker.json" (builtins.toJSON {
     secrets_file = if builtins.isPath cfg.secretsFile then "${cfg.secretsFile}" else cfg.secretsFile;
     state_dir = "/var/lib/secret-broker";
@@ -84,6 +149,30 @@ let
       path = lib.makeBinPath p.path;
       timeout_seconds = p.timeout;
     }) enabledProfiles;
+    approval = {
+      timeout_seconds = acfg.timeout;
+      sealed_max_seconds = acfg.sealedTimeout;
+      pin = {
+        inherit (acfg.pin) enable;
+        min_length = acfg.pin.minLength;
+        max_attempts = acfg.pin.maxAttempts;
+        argon2_memory_kib = acfg.pin.argon2.memoryKiB;
+        argon2_iterations = acfg.pin.argon2.iterations;
+        argon2_parallelism = acfg.pin.argon2.parallelism;
+      };
+      fido2 = {
+        rp_id = acfg.fido2.rpId;
+        tools_dir = "${acfg.fido2.package}/bin";
+        credentials = map (c: {
+          inherit (c) name id type;
+          public_key_file = "${pkgs.writeText "secret-broker-fido2-${c.name}.pem" c.publicKey}";
+        }) acfg.fido2.credentials;
+      };
+      pam = lib.mapAttrsToList (name: m: {
+        inherit name;
+        inherit (m) service label retries;
+      }) pamMethods;
+    };
   });
 in
 {
@@ -171,6 +260,112 @@ in
       '';
     };
 
+    approval = {
+      timeout = mkOption {
+        type = types.ints.positive;
+        default = 120;
+        description = "Seconds an approval dialog waits before refusing.";
+      };
+      sealedTimeout = mkOption {
+        type = types.ints.unsigned;
+        default = 0;
+        description = ''
+          After the session TTL expires (or `secret-broker lock`), the secrets
+          stay in the broker's locked memory, "sealed": a quick approval (PIN,
+          security key, fingerprint) reopens the session without gpg. Wipe them
+          after this many seconds sealed; 0 keeps them until reboot or
+          `secret-broker lock --forget`. Without any quick method configured,
+          expiry always wipes.
+        '';
+      };
+      pin = {
+        enable = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Allow a PIN (set with `secret-broker set-pin`, which asks gpg once)
+            to reopen a sealed session. The broker verifies it: argon2id with a
+            pepper derived from the sops data key, so the stored hash is useless
+            without the secrets themselves. Wrong PINs back off; after
+            `maxAttempts` the secrets are wiped and gpg is needed again.
+          '';
+        };
+        minLength = mkOption {
+          type = types.ints.positive;
+          default = 6;
+        };
+        maxAttempts = mkOption {
+          type = types.ints.positive;
+          default = 5;
+        };
+        argon2 = {
+          memoryKiB = mkOption {
+            type = types.ints.positive;
+            default = 65536;
+          };
+          iterations = mkOption {
+            type = types.ints.positive;
+            default = 3;
+          };
+          parallelism = mkOption {
+            type = types.ints.positive;
+            default = 1;
+          };
+        };
+      };
+      fido2 = {
+        credentials = mkOption {
+          type = types.listOf (types.submodule fido2CredModule);
+          default = [ ];
+          description = ''
+            Security keys (YubiKey, SoloKey...) whose touch reopens a sealed
+            session. Create one with `secret-broker fido2-enroll` and paste the
+            printed snippet. The broker sends a fresh challenge per request and
+            verifies the signature against these public keys; the key must be
+            touched (user presence).
+          '';
+        };
+        rpId = mkOption {
+          type = types.str;
+          default = "secret-broker";
+        };
+        package = mkOption {
+          type = types.package;
+          default = pkgs.libfido2;
+          defaultText = literalExpression "pkgs.libfido2";
+          description = "Provides fido2-token and fido2-assert (run by the broker as separate processes).";
+        };
+      };
+      fingerprint = {
+        enable = mkEnableOption "fingerprint (fprintd) approval of a sealed session";
+        package = mkOption {
+          type = types.package;
+          default = pkgs.fprintd;
+          defaultText = literalExpression "pkgs.fprintd";
+        };
+        label = mkOption {
+          type = types.str;
+          default = "Touch the fingerprint sensor";
+        };
+        retries = mkOption {
+          type = types.ints.positive;
+          default = 3;
+        };
+        timeout = mkOption {
+          type = types.ints.positive;
+          default = 30;
+        };
+      };
+      pam = mkOption {
+        type = types.attrsOf (types.submodule pamMethodModule);
+        default = { };
+        description = ''
+          Extra PAM-based approval methods, run in a helper process
+          (`secret-broker pam-check`) as the broker user, never in the daemon.
+        '';
+      };
+    };
+
     serviceConfig = mkOption {
       type = types.attrs;
       default = { };
@@ -193,7 +388,12 @@ in
     systemd.sockets.secret-broker = {
       description = "secret-broker socket";
       wantedBy = [ "sockets.target" ];
-      listenStreams = [ "/run/secret-broker/broker.sock" ];
+      # fd 3: full socket. fd 4: restricted socket for ai-run sandboxes (run
+      # profiles, status, lock; never unlock/approve/set-pin/dialog).
+      listenStreams = [
+        "/run/secret-broker/broker.sock"
+        "/run/secret-broker/agent.sock"
+      ];
       socketConfig = {
         SocketUser = "root";
         SocketGroup = cfg.group;
@@ -225,7 +425,10 @@ in
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
         PrivateTmp = true;
-        PrivateDevices = true;
+        # FIDO2 keys are /dev/hidraw*: only those, through the device cgroup.
+        PrivateDevices = !fido2Enabled;
+        DevicePolicy = "closed";
+        DeviceAllow = lib.optionals fido2Enabled [ "char-hidraw rw" ];
         ProtectSystem = "strict";
         ProtectHome = true;
         ProtectProc = "invisible";
@@ -247,5 +450,35 @@ in
         RemoveIPC = true;
       } // cfg.serviceConfig;
     };
+
+    assertions = [
+      {
+        assertion = lib.all (m: m.service != "" && !(lib.hasInfix "/" m.service)) (lib.attrValues pamMethods);
+        message = "services.secret-broker.approval.pam: invalid service name";
+      }
+    ];
+
+    # Security keys: give the broker's group access next to systemd's uaccess
+    # ACL (your desktop session keeps access through the ACL).
+    services.udev.extraRules = lib.mkIf fido2Enabled ''
+      ACTION=="add|change", SUBSYSTEM=="hidraw", ENV{ID_FIDO_TOKEN}=="1", GROUP="agent-secrets", MODE="0660"
+    '';
+
+    security.pam.services = lib.mapAttrs' (_: m: lib.nameValuePair m.service { inherit (m) text; })
+      (lib.filterAttrs (_: m: m.text != null) pamMethods);
+
+    services.fprintd.enable = lib.mkIf acfg.fingerprint.enable (lib.mkDefault true);
+
+    # pam_fprintd in the broker's helper verifies *your* finger on behalf of
+    # agent-secrets.
+    security.polkit.extraConfig = lib.mkIf acfg.fingerprint.enable ''
+      polkit.addRule(function(action, subject) {
+        if ((action.id == "net.reactivated.fprint.device.verify" ||
+             action.id == "net.reactivated.fprint.device.setusername") &&
+            subject.user == "agent-secrets") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
   };
 }

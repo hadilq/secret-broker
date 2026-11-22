@@ -3,16 +3,24 @@
 use secret_broker::{client, config, proto::Status, server, sys, Error, Result};
 use std::process::ExitCode;
 
+mod pam;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage:
   secret-broker status [--json]          show lock state, expiry and profiles (never values)
-  secret-broker unlock [--ttl 8h] [--keep-gpg-cache]
-                                         approve a session: gpg/pinentry unwraps the sops data key
-  secret-broker lock                     wipe all secrets from the broker now
+  secret-broker unlock [--ttl 8h] [--gpg] [--keep-gpg-cache]
+                                         open a session. First time after boot (or after
+                                         `lock --forget`): gpg/pinentry. When sealed: PIN,
+                                         security key or fingerprint (--gpg forces gpg)
+  secret-broker lock [--forget]          seal the session now (--forget: wipe secrets from
+                                         memory; the next unlock needs gpg)
+  secret-broker set-pin [--remove]       set (or remove) the quick-approval PIN; asks gpg once
+  secret-broker fido2-enroll [--device /dev/hidrawN] [--name yubikey] [--rp secret-broker]
+                                         create a security-key credential, print the NixOS snippet
   secret-broker run <profile> [args...]  run an allowlisted command (same as secret-run)
   secret-run [--stdin|--no-stdin] <profile> [args...]
-  secret-broker daemon --config FILE [--socket PATH]   (system service)
+  secret-broker daemon --config FILE [--socket PATH] [--agent-socket PATH]   (system service)
   secret-broker version
 ";
 
@@ -50,12 +58,27 @@ fn main() -> ExitCode {
         },
         "status" => status_cmd(rest),
         "unlock" => unlock_cmd(rest),
-        "lock" => match client::lock() {
-            Ok(()) => {
-                println!("locked");
-                ExitCode::SUCCESS
+        "lock" => {
+            let forget = rest.iter().any(|a| a == "--forget");
+            if let Some(bad) = rest.iter().find(|a| *a != "--forget") {
+                return fail(2, format!("unknown option {bad}"));
             }
-            Err(e) => fail(1, e),
+            match client::lock(forget) {
+                Ok(()) => {
+                    println!("{}", if forget { "forgotten (next unlock needs gpg)" } else { "locked" });
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(1, e),
+            }
+        }
+        "set-pin" => set_pin_cmd(rest),
+        "fido2-enroll" => fido2_enroll_cmd(rest),
+        "pam-check" => match rest {
+            [service, user] => match pam::check(service, user) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(1, e),
+            },
+            _ => fail(2, "usage: secret-broker pam-check SERVICE USER"),
         },
         "run" => run_cmd(rest),
         "version" | "--version" => {
@@ -158,15 +181,33 @@ fn status_cmd(args: &[String]) -> ExitCode {
 }
 
 fn print_status(st: &Status) {
-    if st.unlocked {
-        println!(
+    match st.state.as_str() {
+        "open" => println!(
             "state:    unlocked, {} values, expires {} (in {})",
             st.secret_count,
             sys::local_time(st.expires_at_unix),
             fmt_secs(st.remaining_seconds)
-        );
+        ),
+        "sealed" => println!(
+            "state:    sealed ({} values in memory; quick approval opens it)",
+            st.secret_count
+        ),
+        _ => println!("state:    locked (not in memory; unlock needs gpg)"),
+    }
+    if st.methods.is_empty() {
+        println!("approval: gpg only (no quick method configured)");
     } else {
-        println!("state:    locked");
+        println!(
+            "approval: {}{}",
+            st.methods.join(", "),
+            if st.prompter { "; dialog connected" } else { "; no dialog connected" }
+        );
+    }
+    if st.pin_locked_out {
+        println!("PIN:      locked out after too many attempts (unlock with gpg)");
+    }
+    if st.restricted {
+        println!("socket:   restricted (inside ai-run): cannot unlock or approve from here");
     }
     println!("secrets:  {}", st.secrets_file);
     println!(
@@ -203,9 +244,11 @@ fn print_status(st: &Status) {
 fn unlock_cmd(args: &[String]) -> ExitCode {
     let mut ttl = None;
     let mut keep = false;
+    let mut gpg = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--gpg" => gpg = true,
             "--ttl" => match it.next().map(|v| parse_duration(v)) {
                 Some(Ok(v)) => ttl = Some(v),
                 Some(Err(e)) => return fail(2, e),
@@ -224,6 +267,7 @@ fn unlock_cmd(args: &[String]) -> ExitCode {
     match client::unlock(&client::UnlockOptions {
         ttl_seconds: ttl,
         keep_gpg_cache: keep,
+        gpg,
     }) {
         Ok(st) => {
             println!(
@@ -231,6 +275,64 @@ fn unlock_cmd(args: &[String]) -> ExitCode {
                 sys::local_time(st.expires_at_unix),
                 st.secret_count
             );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(1, e),
+    }
+}
+
+fn set_pin_cmd(args: &[String]) -> ExitCode {
+    let mut remove = false;
+    let mut ttl = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--remove" => remove = true,
+            "--ttl" => match it.next().map(|v| parse_duration(v)) {
+                Some(Ok(v)) => ttl = Some(v),
+                Some(Err(e)) => return fail(2, e),
+                None => return fail(2, "--ttl needs a value"),
+            },
+            other => return fail(2, format!("unknown option {other}")),
+        }
+    }
+    match client::set_pin(remove, ttl) {
+        Ok(()) => {
+            println!(
+                "{}",
+                if remove {
+                    "PIN removed (session unlocked)"
+                } else {
+                    "PIN set (session unlocked). A sealed session now opens with this PIN."
+                }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(1, e),
+    }
+}
+
+fn fido2_enroll_cmd(args: &[String]) -> ExitCode {
+    let (mut device, mut name, mut rp) = (None, "yubikey".to_string(), "secret-broker".to_string());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let v = match a.as_str() {
+            "--device" | "--name" | "--rp" => match it.next() {
+                Some(v) => v.clone(),
+                None => return fail(2, format!("{a} needs a value")),
+            },
+            other => return fail(2, format!("unknown option {other}")),
+        };
+        match a.as_str() {
+            "--device" => device = Some(v),
+            "--name" => name = v,
+            _ => rp = v,
+        }
+    }
+    match client::fido2_enroll(device.as_deref(), &name, &rp) {
+        Ok(snippet) => {
+            println!("Add this to your NixOS config (public data only), then rebuild:\n");
+            print!("{snippet}");
             ExitCode::SUCCESS
         }
         Err(e) => fail(1, e),
@@ -280,11 +382,13 @@ fn run_cmd(args: &[String]) -> ExitCode {
 fn daemon(args: &[String]) -> Result<()> {
     let mut cfg_path = None;
     let mut sock = None;
+    let mut agent_sock = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => cfg_path = it.next().cloned(),
             "--socket" => sock = it.next().cloned(),
+            "--agent-socket" => agent_sock = it.next().cloned(),
             other => return Err(Error::msg(format!("unknown option {other}"))),
         }
     }
@@ -298,13 +402,18 @@ fn daemon(args: &[String]) -> Result<()> {
     let cfg = config::load(&cfg_path)?;
     let secrets_file = cfg.secrets_file.clone();
     let srv = server::Server::new(cfg)?;
-    let listener = server::listener(sock.as_deref())?;
+    let (listener, agent) = server::listeners(sock.as_deref(), agent_sock.as_deref())?;
     install_signal_handler(std::sync::Arc::clone(&srv))?;
     eprintln!(
-        "secret-broker {VERSION}: {} profiles, secrets file {secrets_file}",
-        srv.profile_count()
+        "secret-broker {VERSION}: {} profiles, secrets file {secrets_file}{}",
+        srv.profile_count(),
+        if agent.is_some() { ", restricted socket for sandboxes" } else { "" }
     );
-    srv.serve(listener)
+    if let Some(agent) = agent {
+        let srv = std::sync::Arc::clone(&srv);
+        std::thread::spawn(move || srv.serve(agent, true));
+    }
+    srv.serve(listener, false)
 }
 
 /// SIGTERM/SIGINT/SIGHUP: wipe secrets, then exit (via a self-pipe thread, so
