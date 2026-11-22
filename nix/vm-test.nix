@@ -106,6 +106,31 @@ let
             sys.exit(0 if m["ok"] else 1)
   '';
 
+  # What root could do: change an entry and recompute the whole chain, so
+  # the file alone verifies; only the journal's copy of the hashes tells.
+  rechain = pkgs.writers.writePython3 "rechain" { } ''
+    import hashlib
+    import json
+    import sys
+
+    path = sys.argv[1]
+    lines = [ln for ln in open(path).read().splitlines() if ln]
+    prev = json.loads(lines[0])["prev"]
+    out = []
+    done = False
+    for ln in lines:
+        v = json.loads(ln)
+        if not done and v.get("outcome") == "denied":
+            v["outcome"] = "granted"
+            done = True
+        v["prev"] = prev
+        ln = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+        out.append(ln)
+        prev = hashlib.sha256(ln.encode()).hexdigest()
+    open(path, "w").write("\n".join(out) + "\n")
+    print("rewritten" if done else "nothing to change")
+  '';
+
   swayConfig = pkgs.writeText "sway-test.conf" ''
     output HEADLESS-1 resolution 1280x800 scale 1
     output * bg #0f1e19 solid_color
@@ -115,7 +140,7 @@ let
   aiRunConfig = pkgs.writeText "ai-run.json" (builtins.toJSON {
     bwrap = "${pkgs.bubblewrap}/bin/bwrap";
     dbus_proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
-    mask = [ ".gnupg" ".config/gh" ".zsh_history" ".agent-login" "/run/docker.sock" "/run/secret-broker/broker.sock" ];
+    mask = [ ".gnupg" ".config/gh" ".zsh_history" ".agent-login" "/run/docker.sock" "/run/secret-broker/broker.sock" "/var/log/secret-broker" ];
     env.SECRET_BROKER_SOCKET = "/run/secret-broker/agent.sock";
     writable = [ "dev" ];
     env_unset = [ "DISPLAY" ];
@@ -277,6 +302,15 @@ in
         machine.fail(h(f"cat /proc/{bpid}/environ"))
         machine.fail(h(f"exec 3< /proc/{bpid}/mem"))
         machine.succeed(h(f"timeout 5 strace -p {bpid} 2>&1 | grep -q 'Operation not permitted'"))
+        # The broker keeps no capability; only its /proc helper has
+        # CAP_SYS_PTRACE (bit 19); commands it runs get none, and don't
+        # inherit the listening sockets.
+        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{bpid}/status").strip() == "0000000000000000"
+        hpid = machine.succeed(f"pgrep -P {bpid} -f proc-helper").strip()
+        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{hpid}/status").strip() == "0000000000080000"
+        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{pid}/status").strip() == "0000000000000000"
+        fds = machine.succeed(f"ls /proc/{pid}/fd").split()
+        assert sorted(fds) == ["0", "1", "2"], fds
         machine.succeed("pkill -u agent-secrets -x sleep || true")
 
     with subtest("ai-run: credentials masked, home read-only, broker reachable"):
@@ -366,6 +400,16 @@ in
         assert any("Wrong PIN" in m.get("message", "") for m in r), r
         assert any(m.get("kind") == "done" and m["ok"] for m in r), r
         assert SECRET not in machine.succeed("journalctl -u secret-broker --no-pager")
+        # the broker's own snapshot of the requester
+        c = req["caller"]
+        assert c["socket"] == "agent.sock" and c["sandboxed"] and c["verified"], c
+        assert c["ai_run_profile"] == "default", c
+        assert c["exe"].endswith("/bin/secret-broker") and c["cwd"].startswith("/"), c
+        assert c["argv"][-2:] == ["demo", "hash"], c
+        assert c["user"] == "hadi" and c["uid"] == 1000 and c["unit"], c
+        assert any(p["comm"] == "bwrap" for p in c["parents"]), c
+        owner = req["session"]["unlocked"]
+        assert owner["method"] == "gpg" and owner["user"] == "hadi" and owner["socket"] == "broker.sock", owner
 
     with subtest("deny in the dialog"):
         machine.succeed(h("secret-broker lock"))
@@ -431,10 +475,67 @@ in
         # keyboard capability; Ctrl+U clears whatever arrived)
         machine.succeed(h(f"{wl} wtype -s 300 9999 -k Return"))
         machine.sleep(1)
+        # Tab: full details of the requester and the session owner
+        machine.succeed(h(f"{wl} wtype -s 400 -k Tab"))
+        machine.sleep(1)
+        machine.succeed(h(f"{wl} grim /tmp/dialog-details.png"))
+        machine.copy_from_machine("/tmp/dialog-details.png", "")
+        machine.succeed(h(f"{wl} wtype -s 400 -k Down -k Down"))
         machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 2468 -k Return"))
         machine.wait_until_succeeds("test -e /tmp/real.rc")
         assert machine.succeed("cat /tmp/real.rc").strip() == "0", machine.succeed("cat /tmp/real.out /tmp/dialog-real.log")
         assert machine.succeed("cat /tmp/real.out").strip() == HASH
+
+    with subtest("audit log: every event with its caller; hadi reads it, can't change it; sandboxes can't see it"):
+        machine.fail(h(f"secret-run demo {SECRET}"))  # refused, argv logged redacted
+        d = "/var/log/secret-broker"
+        assert machine.succeed(f"stat -c %a:%U:%G {d}").strip() == "2750:agent-secrets:secret-broker"
+        assert machine.succeed(f"stat -c %a:%U:%G {d}/audit.jsonl").strip() == "640:agent-secrets:secret-broker"
+        raw = machine.succeed(h("cat /var/log/secret-broker/audit.jsonl"))
+        assert SECRET not in raw and "[REDACTED]" in raw
+        assert SECRET not in machine.succeed("journalctl --no-pager -o json SYSLOG_IDENTIFIER=secret-broker")
+        machine.fail(h(f"echo x >> {d}/audit.jsonl"))
+        machine.fail(h(f"rm -f {d}/audit.jsonl"))
+        machine.fail(h(f"mv {d}/audit.jsonl {d}/x"))
+        machine.fail(h("ai-run -- secret-broker log"))
+        machine.fail(h(f"ai-run -- cat {d}/audit.jsonl"))
+        assert "chain OK" in machine.succeed(h("secret-broker log verify"))
+        assert "chain OK" in machine.succeed("secret-broker log verify --journal")
+        import json as _j
+        ev = [_j.loads(l) for l in machine.succeed(h("secret-broker log --json")).splitlines()]
+        got = {(e["event"], e["outcome"]) for e in ev}
+        for want in [("broker_start", "ok"), ("unlock", "ok"), ("lock", "sealed"),
+                     ("lock", "wiped"), ("expire", "sealed"), ("set_pin", "ok"), ("prompter_register", "ok"),
+                     ("prompter_register", "refused"), ("approval", "granted"), ("approval", "denied"),
+                     ("pin_wrong", "failed"), ("pin_lockout", "wiped"), ("exec_start", "started"),
+                     ("exec_end", "ok"), ("exec", "refused")]:
+            assert want in got, (want, sorted(got))
+        methods = {e.get("method") for e in ev if e["event"] == "approval" and e["outcome"] == "granted"}
+        assert {"pin", "fido2", "mock"} <= methods, methods
+        assert any(e["event"] == "unlock" and e.get("method") == "gpg" and e["caller"]["socket"] == "broker.sock" for e in ev)
+        sb = [e for e in ev if e["event"] == "exec_end" and e["caller"].get("ai_run_profile") == "default"]
+        assert sb and sb[0]["caller"]["socket"] == "agent.sock" and sb[0]["args"] == ["hash"], sb[:1]
+        assert "duration_ms" in sb[0] and sb[0]["exit_code"] == 0, sb[0]
+        assert "exe" in sb[0]["caller"] and sb[0]["caller"]["parents"], sb[0]
+        # human view and filters
+        out = machine.succeed(h("secret-broker log --event approval --since 1h"))
+        assert "approval granted method=pin" in out and "exec_end" not in out, out
+        # structured journal fields
+        j = machine.succeed("journalctl --no-pager -o json SYSLOG_IDENTIFIER=secret-broker AUDIT_EVENT=approval AUDIT_OUTCOME=granted")
+        assert '"CALLER_USER":"hadi"' in j and '"AUDIT_HASH"' in j, j[:500]
+        # tampering: an edit breaks the chain; a full rewrite only the journal catches
+        machine.succeed(f"rm -rf /tmp/ac && cp -a {d} /tmp/ac")
+        machine.succeed("sed -i '0,/\"outcome\":\"denied\"/s//\"outcome\":\"granted\"/' /tmp/ac/audit.jsonl")
+        out = machine.fail("secret-broker log verify --dir /tmp/ac")
+        assert "PROBLEM" in out, out
+        machine.succeed(f"rm -rf /tmp/ac && cp -a {d} /tmp/ac")
+        assert "rewritten" in machine.succeed("${rechain} /tmp/ac/audit.jsonl")
+        assert "chain OK" in machine.succeed("secret-broker log verify --dir /tmp/ac")
+        out = machine.fail("secret-broker log verify --journal --dir /tmp/ac")
+        assert "differs from the journal" in out, out
+        # status names the session owner
+        machine.succeed(h("secret-broker unlock --ttl 1h"))
+        assert "owner:    " in machine.succeed(h("secret-broker status"))
 
     with subtest("service restart wipes"):
         machine.succeed(h("secret-broker unlock --ttl 1h"))

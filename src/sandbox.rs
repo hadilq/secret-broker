@@ -226,6 +226,11 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         "/dev",
         "--proc",
         "/proc",
+        // Also in the environment below; here so the broker can name the
+        // profile from bwrap's command line (it never reads environments).
+        "--setenv",
+        "AI_RUN_PROFILE",
+        name,
     ]);
     if prof.gui {
         push(&["--dev-bind-try", "/dev/dri", "/dev/dri"]);

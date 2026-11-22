@@ -20,7 +20,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   secret-broker-dialog [prompter] [--font FILE] [--font-bold FILE] [--theme colors.toml]
   secret-broker-dialog pinentry [--fallback /path/to/pinentry-curses] [--font FILE] ...
-  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--window]
+  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--window]
 ";
 
 #[derive(Debug, Default)]
@@ -59,15 +59,67 @@ pub fn load_fonts(o: &Opts) -> Result<render::Fonts, String> {
 }
 
 fn demo_prompt() -> secret_broker::proto::Prompt {
+    use secret_broker::proto::{Caller, Owner, ProcInfo, SessionInfo};
+    let now = secret_broker::sys::now_unix_i64();
+    let store = "/nix/store/0lk2sj7ry4m754mv16kapc1a71i2ma66";
+    let caller = Caller {
+        pid: 48213,
+        uid: 1000,
+        gid: 100,
+        user: "hadi".into(),
+        socket: "agent.sock".into(),
+        sandboxed: true,
+        ai_run_profile: "grok-bot".into(),
+        comm: "secret-run".into(),
+        exe: format!("{store}-secret-broker-0.2.0/bin/secret-broker"),
+        cwd: "/home/hadi/dev/secret-broker".into(),
+        argv: ["secret-run", "gh", "pr", "list", "--repo", "hadilq/secret-broker"].iter().map(|s| s.to_string()).collect(),
+        cgroup: "/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-grok\\x2dbot-3141.scope".into(),
+        unit: "app-Hyprland-grok\\x2dbot-3141.scope".into(),
+        app: "grok-bot".into(),
+        launcher: "Hyprland".into(),
+        login_session: "2".into(),
+        seat: "seat0".into(),
+        tty: "tty1".into(),
+        session_type: "wayland/user".into(),
+        audit_session: Some(2),
+        loginuid: Some(1000),
+        start_time: 1,
+        parents: vec![
+            ProcInfo { pid: 48190, uid: 1000, comm: "bash".into(), exe: format!("{store}-bash-5.3/bin/bash"), argv: vec!["bash".into(), "-c".into(), "secret-run gh pr list".into()] },
+            ProcInfo { pid: 47002, uid: 1000, comm: "grok-bot".into(), exe: format!("{store}-grok-bot/bin/grok-bot"), argv: vec!["grok-bot".into()] },
+            ProcInfo { pid: 47001, uid: 1000, comm: "bwrap".into(), exe: format!("{store}-bubblewrap-0.11/bin/bwrap"), argv: vec!["bwrap".into(), "--die-with-parent".into(), "--unshare-pid".into(), "…".into()] },
+            ProcInfo { pid: 46990, uid: 1000, comm: "bwrap".into(), exe: format!("{store}-bubblewrap-0.11/bin/bwrap"), argv: vec!["bwrap".into(), "…".into()] },
+            ProcInfo { pid: 2210, uid: 1000, comm: "systemd".into(), exe: format!("{store}-systemd-258/lib/systemd/systemd"), argv: vec!["/run/current-system/systemd/lib/systemd/systemd".into(), "--user".into()] },
+        ],
+        snapshot_unix: now,
+        verified: true,
+        notes: Vec::new(),
+    };
+    let owner = Owner {
+        user: "hadi".into(),
+        uid: 1000,
+        pid: 3317,
+        command: "secret-broker unlock".into(),
+        exe: format!("{store}-secret-broker-0.2.0/bin/secret-broker"),
+        app: "foot (via Hyprland)".into(),
+        socket: "broker.sock".into(),
+        sandboxed: false,
+        method: "gpg".into(),
+        via: "gpg".into(),
+        at_unix: now.saturating_sub(5 * 3600),
+    };
+    let mut opened = owner.clone();
+    opened.method = "pin".into();
+    opened.via = "dialog".into();
+    opened.at_unix = now.saturating_sub(3600);
+    opened.command = "secret-run gh pr view 12".into();
+    opened.app = "grok-bot (via Hyprland)".into();
+    opened.sandboxed = true;
+    opened.socket = "agent.sock".into();
     secret_broker::proto::Prompt {
         kind: "request".into(),
         id: 1,
-        requester: Some(secret_broker::proto::Requester {
-            pid: i32::try_from(std::process::id()).unwrap_or(0),
-            uid: secret_broker::sys::getuid(),
-            user: secret_broker::sys::name_of(secret_broker::sys::getuid()).unwrap_or_default(),
-            sandboxed: true,
-        }),
         purpose: "secret-run gh pr list --repo hadilq/secret-broker".into(),
         ttl_seconds: 8 * 3600,
         methods: vec!["pin".into(), "fido2".into()],
@@ -75,6 +127,13 @@ fn demo_prompt() -> secret_broker::proto::Prompt {
         phrase: "blue otter".into(),
         attempts_left: 5,
         timeout_seconds: 120,
+        caller: Some(caller),
+        session: Some(SessionInfo {
+            state: "sealed".into(),
+            expires_at_unix: 0,
+            unlocked: Some(owner),
+            opened: Some(opened),
+        }),
         ..Default::default()
     }
 }
@@ -84,6 +143,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let mut scale = 1i32;
     let mut window = false;
     let mut pin_mode = false;
+    let mut details = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -91,6 +151,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
             "--scale" => scale = it.next().and_then(|v| v.parse().ok()).ok_or("--scale N")?,
             "--window" => window = true,
             "--pinentry" => pin_mode = true,
+            "--details" => details = true,
             _ => {}
         }
     }
@@ -105,6 +166,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     } else {
         let mut v = prompter::view_for(&demo_prompt());
         v.message = Some(("Wrong PIN, 4 attempts left".into(), ui::Tone::Error));
+        v.show_details = details;
         v
     };
     let fonts = load_fonts(o)?;

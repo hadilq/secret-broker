@@ -66,6 +66,39 @@ impl Fonts {
         out
     }
 
+    /// Word wrap without a line limit; words wider than `max` (paths, store
+    /// hashes) are broken between characters.
+    pub fn wrap_hard(&mut self, bold: bool, text: &str, px: f32, max: f32) -> Vec<String> {
+        let mut lines = Vec::new();
+        for para in text.split('\n') {
+            let mut cur = String::new();
+            for word in para.split(' ') {
+                let cand = if cur.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{cur} {word}")
+                };
+                if self.width(bold, &cand, px) <= max {
+                    cur = cand;
+                    continue;
+                }
+                if !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                }
+                for ch in word.chars() {
+                    cur.push(ch);
+                    if self.width(bold, &cur, px) > max && cur.chars().count() > 1 {
+                        cur.pop();
+                        lines.push(std::mem::take(&mut cur));
+                        cur.push(ch);
+                    }
+                }
+            }
+            lines.push(cur);
+        }
+        lines
+    }
+
     /// Greedy word wrap into at most `max_lines` lines.
     pub fn wrap(&mut self, bold: bool, text: &str, px: f32, max: f32, max_lines: usize) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();

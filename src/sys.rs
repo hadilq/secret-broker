@@ -245,6 +245,30 @@ pub fn clear_cloexec(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Set FD_CLOEXEC so `fd` doesn't leak into commands we start.
+pub fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl on an fd we own; no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let r = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Close every fd >= `from` (close_range(2)).
+pub fn close_from(from: u32) {
+    // SAFETY: close_range takes integers only; we own no fds >= from that
+    // are still in use at this point.
+    unsafe {
+        libc::syscall(libc::SYS_close_range, from, u32::MAX, 0);
+    }
+}
+
 /// Whether a pid exists in our pid namespace.
 pub fn pid_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 only checks for existence/permission.
@@ -330,4 +354,163 @@ pub fn no_echo(fd: RawFd) -> Result<EchoGuard> {
         return Err(last_os_error("tcsetattr"));
     }
     Ok(EchoGuard { fd, saved })
+}
+
+pub fn now_unix_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Linux 6.5+: a pidfd for the peer of a unix socket.
+const SO_PEERPIDFD: libc::c_int = 77;
+
+/// A pidfd pinning the process that connected (None on older kernels).
+pub fn peer_pidfd(fd: RawFd) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let mut pidfd: libc::c_int = -1;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).ok()?;
+    // SAFETY: pidfd/len point to properly sized, writable locals.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            (&mut pidfd as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if r != 0 || pidfd < 0 {
+        return None;
+    }
+    // SAFETY: the kernel just gave us this new fd; we own it.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd) };
+    // Don't leak it into a command another thread is starting.
+    let _ = set_cloexec(pidfd);
+    Some(fd)
+}
+
+/// Whether the process behind a pidfd still runs (a pidfd never refers to a
+/// reused pid).
+pub fn pidfd_alive(pidfd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: pidfd_send_signal(fd, 0, NULL, 0) only checks the target.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::c_void>(),
+            0,
+        )
+    };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Drop every capability of this thread (call before spawning threads):
+/// clear the ambient set, then empty effective/permitted/inheritable.
+pub fn drop_all_caps() -> Result<()> {
+    // SAFETY: prctl with integer arguments only.
+    let r = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    };
+    if r != 0 {
+        return Err(last_os_error("prctl(PR_CAP_AMBIENT_CLEAR_ALL)"));
+    }
+    let mut hdr = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: hdr and data are valid capset arguments for version 3 (two
+    // CapData entries) and live across the call.
+    let r = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) };
+    if r != 0 {
+        return Err(last_os_error("capset"));
+    }
+    Ok(())
+}
+
+/// Effective capability mask of this process (from /proc/self/status).
+pub fn effective_caps() -> Option<u64> {
+    let t = std::fs::read_to_string("/proc/self/status").ok()?;
+    let v = t.lines().find_map(|l| l.strip_prefix("CapEff:"))?;
+    u64::from_str_radix(v.trim(), 16).ok()
+}
+
+/// RFC 3339 UTC with milliseconds, e.g. "2026-11-22T16:54:03.123Z".
+pub fn utc_time_ms(unix_ms: u64) -> String {
+    let secs = unix_ms.checked_div(1000).unwrap_or(0);
+    let ms = unix_ms.checked_rem(1000).unwrap_or(0);
+    let t: libc::time_t = i64::try_from(secs).unwrap_or(0);
+    let mut tm: libc::tm = {
+        // SAFETY: tm is a plain C struct; all-zero is valid.
+        unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: both pointers are valid locals.
+    let r = unsafe { libc::gmtime_r(&t, &mut tm) };
+    if r.is_null() {
+        return format!("@{secs}");
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{ms:03}Z",
+        tm.tm_year.saturating_add(1900),
+        tm.tm_mon.saturating_add(1),
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
+}
+
+/// Local wall-clock time -> unix seconds (mktime).
+pub fn local_to_unix(year: i32, month: i32, day: i32, hour: i32, min: i32, sec: i32) -> Option<i64> {
+    let mut tm: libc::tm = {
+        // SAFETY: tm is a plain C struct; all-zero is valid.
+        unsafe { std::mem::zeroed() }
+    };
+    tm.tm_year = year.checked_sub(1900)?;
+    tm.tm_mon = month.checked_sub(1)?;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    tm.tm_isdst = -1;
+    // SAFETY: tm is a valid, initialised struct.
+    let t = unsafe { libc::mktime(&mut tm) };
+    (t != -1).then_some(t)
 }

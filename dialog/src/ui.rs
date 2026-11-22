@@ -63,6 +63,11 @@ pub struct View {
     pub footer: String,
     pub deadline: Option<Instant>,
     pub busy: bool,
+    /// Full details (label, value, tone), shown with Tab, scrolled with
+    /// the arrow keys. Values are wrapped.
+    pub details: Vec<(String, String, Tone)>,
+    pub show_details: bool,
+    pub scroll: usize,
 }
 
 #[derive(Debug)]
@@ -264,6 +269,10 @@ const TITLE_PX: f32 = 21.0;
 const BODY_PX: f32 = 14.5;
 const SMALL_PX: f32 = 12.5;
 const ROW_H: f32 = 22.0;
+const DETAIL_PX: f32 = 12.5;
+const DETAIL_H: f32 = 18.0;
+const DETAIL_VISIBLE: usize = 16;
+const DETAIL_LABEL_W: f32 = 104.0;
 
 fn tone(t: &Theme, tone: Tone) -> Rgb {
     match tone {
@@ -282,10 +291,35 @@ fn body_lines(fonts: &mut Fonts, v: &View) -> Vec<String> {
     fonts.wrap(false, &v.body, BODY_PX, W as f32 - 2.0 * PAD, 8)
 }
 
+/// Wrapped detail lines (label only on the first line of each value).
+fn detail_lines(fonts: &mut Fonts, v: &View) -> Vec<(String, String, Tone)> {
+    let width = W as f32 - 2.0 * PAD - 24.0 - DETAIL_LABEL_W;
+    let mut out = Vec::new();
+    for (label, value, tone) in &v.details {
+        if label.is_empty() && value.is_empty() {
+            out.push((String::new(), String::new(), Tone::Muted));
+            continue;
+        }
+        for (i, line) in fonts.wrap_hard(false, value, DETAIL_PX, width).into_iter().enumerate() {
+            out.push((if i == 0 { label.clone() } else { String::new() }, line, *tone));
+        }
+    }
+    out
+}
+
+fn details_height(fonts: &mut Fonts, v: &View) -> f32 {
+    if !v.show_details || v.details.is_empty() {
+        return 0.0;
+    }
+    let n = detail_lines(fonts, v).len().min(DETAIL_VISIBLE);
+    14.0 + n as f32 * DETAIL_H + 12.0 + DETAIL_H
+}
+
 /// Logical height for a view.
 fn layout_height(fonts: &mut Fonts, v: &View) -> u32 {
     let mut h = PAD + TITLE_PX + 14.0;
     h += v.rows.len() as f32 * ROW_H;
+    h += details_height(fonts, v);
     let body = body_lines(fonts, v).len();
     if body > 0 {
         h += body as f32 * ROW_H + 6.0;
@@ -332,6 +366,34 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, input_len: 
         c.text(fonts, false, x, y, BODY_PX * s, label, t.muted);
         let val = fonts.ellipsize(false, value, BODY_PX * s, inner - label_w);
         c.text(fonts, false, x + label_w, y, BODY_PX * s, &val, tone(t, *tn));
+    }
+    if v.show_details && !v.details.is_empty() {
+        let lines = detail_lines(fonts, v);
+        let n = lines.len();
+        let shown = n.min(DETAIL_VISIBLE);
+        let first = v.scroll.min(n.saturating_sub(shown));
+        let top = y + 10.0 * s;
+        let ph = (shown as f32 * DETAIL_H + 12.0) * s;
+        c.round_rect(x, top, inner, ph, 8.0 * s, t.surface);
+        let mut ly = top + 4.0 * s;
+        for (label, value, tn) in lines.iter().skip(first).take(shown) {
+            ly += DETAIL_H * s;
+            let lx = x + 12.0 * s;
+            if !label.is_empty() {
+                let l = fonts.ellipsize(false, label, DETAIL_PX * s, (DETAIL_LABEL_W - 6.0) * s);
+                c.text(fonts, false, lx, ly, DETAIL_PX * s, &l, t.muted);
+            }
+            let val = fonts.ellipsize(false, value, DETAIL_PX * s, inner - (24.0 + DETAIL_LABEL_W) * s);
+            c.text(fonts, false, lx + DETAIL_LABEL_W * s, ly, DETAIL_PX * s, &val, tone(t, *tn));
+        }
+        let ind = if n > shown {
+            format!("lines {}–{} of {n}   ↑ ↓ PgUp PgDn scroll", first + 1, first + shown)
+        } else {
+            format!("{n} lines")
+        };
+        let iy = top + ph + (DETAIL_H - 2.0) * s;
+        c.text(fonts, false, x + 4.0 * s, iy, SMALL_PX * s, &ind, t.muted);
+        y = top + ph + DETAIL_H * s;
     }
     let body = body_lines(fonts, v);
     if !body.is_empty() {
@@ -415,9 +477,32 @@ impl App {
         }
     }
 
+    fn scroll_by(&mut self, delta: isize) {
+        let n = detail_lines(&mut self.fonts, &self.view).len();
+        let max = n.saturating_sub(DETAIL_VISIBLE);
+        let cur = self.view.scroll.min(max);
+        self.view.scroll = if delta < 0 {
+            cur.saturating_sub(delta.unsigned_abs())
+        } else {
+            cur.saturating_add(delta.unsigned_abs()).min(max)
+        };
+        self.dirty = true;
+    }
+
     fn key(&mut self, ev: KeyEvent) {
+        let details = !self.view.details.is_empty();
         match ev.keysym {
             Keysym::Escape => self.events.push_back(UiEvent::Cancel),
+            Keysym::Tab | Keysym::ISO_Left_Tab if details => {
+                self.view.show_details = !self.view.show_details;
+                self.dirty = true;
+            }
+            Keysym::Up if self.view.show_details => self.scroll_by(-1),
+            Keysym::Down if self.view.show_details => self.scroll_by(1),
+            Keysym::Page_Up if self.view.show_details => self.scroll_by(-(DETAIL_VISIBLE as isize - 2)),
+            Keysym::Page_Down if self.view.show_details => self.scroll_by(DETAIL_VISIBLE as isize - 2),
+            Keysym::Home if self.view.show_details => self.scroll_by(-100_000),
+            Keysym::End if self.view.show_details => self.scroll_by(100_000),
             Keysym::Return | Keysym::KP_Enter => {
                 if self.view.busy {
                     return;
@@ -526,7 +611,7 @@ impl KeyboardHandler for App {
         self.key(ev);
     }
     fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
-        if ev.keysym == Keysym::BackSpace {
+        if matches!(ev.keysym, Keysym::BackSpace | Keysym::Up | Keysym::Down | Keysym::Page_Up | Keysym::Page_Down) {
             self.key(ev);
         }
     }

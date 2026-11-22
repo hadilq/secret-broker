@@ -76,6 +76,7 @@ fn start(name: &str, extra: serde_json::Value) -> Option<Daemon> {
                 "allow": [["**"]]
             }
         },
+        "audit": {"directory": dir.join("audit"), "journal": false},
         "approval": {
             "timeout_seconds": 20,
             "pin": {"enable": true, "min_length": 4, "max_attempts": 3,
@@ -135,11 +136,16 @@ fn status(sock: &Path) -> Status {
 
 /// Run the "echo" profile; Ok(stdout) or Err(error).
 fn exec(sock: &Path) -> Result<String, String> {
+    exec_args(sock, &[])
+}
+
+fn exec_args(sock: &Path, args: &[&str]) -> Result<String, String> {
     let mut s = send(
         sock,
         &Request {
             op: "exec".into(),
             profile: "echo".into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
             ..Default::default()
         },
         &[],
@@ -213,6 +219,11 @@ fn states_pin_and_restricted_socket() {
     assert!(call(&main, &req("unlock"), &[(proto::T_KEY, &key)]).ok);
     assert_eq!(status(&main).state, "open");
     assert_eq!(exec(&agent).unwrap(), "ran\n");
+    // A secret value in argv is redacted in the log.
+    assert_eq!(exec_args(&agent, &["--token=tok-123456"]).unwrap(), "ran\n");
+    let st = status(&main);
+    let owner = st.session.as_ref().unwrap().unlocked.as_ref().unwrap();
+    assert_eq!((owner.method.as_str(), owner.socket.as_str()), ("gpg", "broker.sock"));
     assert!(call(&main, &req("lock"), &[]).ok);
     assert_eq!(status(&main).state, "cold");
 
@@ -257,6 +268,15 @@ fn states_pin_and_restricted_socket() {
     assert_eq!(p.phrase, "blue otter");
     assert!(p.requester.as_ref().unwrap().sandboxed);
     assert!(p.purpose.contains("secret-run echo"));
+    // The broker's own snapshot of the caller (this test process).
+    let c = p.caller.as_ref().unwrap();
+    assert!(c.sandboxed && c.socket == "agent.sock");
+    assert!(c.verified, "{:?}", c.notes);
+    assert!(!c.exe.is_empty() && !c.cwd.is_empty() && !c.argv.is_empty(), "{c:?}");
+    assert!(!c.parents.is_empty());
+    let sess = p.session.as_ref().unwrap();
+    assert_eq!(sess.state, "sealed");
+    assert_eq!(sess.unlocked.as_ref().unwrap().method, "gpg");
     dlg.pin(p.id, b"0000");
     let u = dlg.next();
     assert_eq!(u.kind, "update");
@@ -306,6 +326,81 @@ fn states_pin_and_restricted_socket() {
     assert!(call(&main, &Request { op: "lock".into(), forget: true, ..Default::default() }, &[]).ok);
     assert_eq!(status(&main).state, "cold");
     drop(dlg);
+    // Client-side events (fido2-enroll) can be reported, not from a sandbox.
+    let rep = Request {
+        op: "report".into(),
+        event: "fido2_enroll".into(),
+        details: [("name".to_string(), "yubikey".to_string()), ("credential_id".to_string(), "Y3JlZA==".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    assert!(call(&main, &rep, &[]).ok);
+    assert!(!call(&agent, &rep, &[]).ok);
+    check_audit(&d);
+}
+
+fn check_audit(d: &Daemon) {
+    use secret_broker::audit;
+    let dir = d.dir.join("audit");
+    let lines = audit::read_all(&dir).unwrap();
+    let r = audit::verify(&lines);
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
+    assert_eq!(r.first_seq, 1);
+    let mode = std::fs::metadata(dir.join(audit::FILE)).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640);
+    let raw: String = lines.iter().map(|l| l.raw.clone() + "\n").collect();
+    assert!(!raw.contains("tok-123456"), "secret value in the audit log");
+    assert!(raw.contains("--token=[REDACTED]"));
+    let has = |event: &str, outcome: &str, extra: &dyn Fn(&serde_json::Value) -> bool| {
+        lines.iter().filter_map(|l| l.value.as_ref()).any(|v| {
+            v["event"] == event && v["outcome"] == outcome && extra(v)
+        })
+    };
+    let any = |_: &serde_json::Value| true;
+    assert!(has("broker_start", "ok", &any));
+    assert!(has("unlock", "ok", &|v| v["method"] == "gpg" && v["caller"]["socket"] == "broker.sock"));
+    assert!(has("unlock", "failed", &any));
+    assert!(has("unlock", "refused", &|v| v["caller"]["socket"] == "agent.sock"));
+    assert!(has("set_pin", "refused", &any));
+    assert!(has("prompter_register", "refused", &any));
+    assert!(has("set_pin", "ok", &any));
+    assert!(has("set_pin", "failed", &any));
+    assert!(has("exec", "refused", &|v| v["reason"].as_str().unwrap_or("").contains("not in memory")));
+    assert!(has("exec_start", "started", &|v| v["profile"] == "echo"));
+    assert!(has("exec_end", "ok", &|v| v["exit_code"] == 0 && v["duration_ms"].is_u64()));
+    assert!(has("lock", "wiped", &|v| v["forget"] == false));
+    assert!(has("lock", "wiped", &|v| v["forget"] == true));
+    assert!(has("lock", "sealed", &any));
+    assert!(has("prompter_register", "ok", &any));
+    assert!(has("approval", "granted", &|v| v["method"] == "pin" && v["via"] == "dialog"));
+    assert!(has("approval", "denied", &any));
+    assert!(has("pin_wrong", "failed", &any));
+    assert!(has("pin_lockout", "wiped", &any));
+    assert!(has("fido2_enroll", "reported", &|v| v["name"] == "yubikey" && v["credential_id"] == "Y3JlZA=="));
+    assert!(has("report", "refused", &any));
+    // Caller details from the /proc helper.
+    assert!(has("exec_end", "ok", &|v| {
+        let c = &v["caller"];
+        c["exe"].as_str().is_some_and(|e| !e.is_empty())
+            && c["cwd"].as_str().is_some_and(|e| !e.is_empty())
+            && c["parents"].as_array().is_some_and(|p| !p.is_empty())
+            && c["verified"] == true
+    }));
+    // `secret-broker log` and `log verify` on it.
+    let bin = env!("CARGO_BIN_EXE_secret-broker");
+    let out = Command::new(bin).args(["log", "--dir"]).arg(&dir).args(["--event", "approval"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && text.contains("approval granted method=pin"), "{text}");
+    assert!(!text.contains("exec_end"));
+    let out = Command::new(bin).args(["log", "verify", "--dir"]).arg(&dir).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    // Tampering is detected.
+    let f = dir.join(audit::FILE);
+    let t = std::fs::read_to_string(&f).unwrap();
+    std::fs::write(&f, t.replacen("\"outcome\":\"denied\"", "\"outcome\":\"granted\"", 1)).unwrap();
+    let out = Command::new(bin).args(["log", "verify", "--dir"]).arg(&dir).output().unwrap();
+    assert!(!out.status.success());
 }
 
 #[test]

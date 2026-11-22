@@ -18,6 +18,10 @@ const USAGE: &str = "usage:
   secret-broker set-pin [--remove]       set (or remove) the quick-approval PIN; asks gpg once
   secret-broker fido2-enroll [--device /dev/hidrawN] [--name yubikey] [--rp secret-broker]
                                          create a security-key credential, print the NixOS snippet
+  secret-broker log [-f] [--since 2h|2026-11-22] [--event unlock,exec*] [-n N] [--json]
+                                         show the audit log (who locked/unlocked/ran what)
+  secret-broker log verify [--journal]   check the log's hash chain (and against journald)
+  secret-broker log head                 print the latest entry's hash (write it down)
   secret-broker run <profile> [args...]  run an allowlisted command (same as secret-run)
   secret-run [--stdin|--no-stdin] <profile> [args...]
   secret-broker daemon --config FILE [--socket PATH] [--agent-socket PATH]   (system service)
@@ -73,6 +77,14 @@ fn main() -> ExitCode {
         }
         "set-pin" => set_pin_cmd(rest),
         "fido2-enroll" => fido2_enroll_cmd(rest),
+        "proc-helper" => match secret_broker::caller::helper_main() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(1, e),
+        },
+        "log" => match secret_broker::audit::cli(rest) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => fail(1, e),
+        },
         "pam-check" => match rest {
             [service, user] => match pam::check(service, user) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -202,6 +214,28 @@ fn print_status(st: &Status) {
             st.methods.join(", "),
             if st.prompter { "; dialog connected" } else { "; no dialog connected" }
         );
+    }
+    if let Some(s) = &st.session {
+        let who = |o: &secret_broker::proto::Owner| {
+            format!(
+                "{} ({}) by {} pid {} `{}`{}{}",
+                sys::local_time(o.at_unix),
+                o.method,
+                o.user,
+                o.pid,
+                server::sanitize(&o.command, 80),
+                if o.app.is_empty() { String::new() } else { format!(" in {}", o.app) },
+                if o.sandboxed { " [sandbox]" } else { "" }
+            )
+        };
+        if let Some(o) = &s.unlocked {
+            println!("owner:    {}", who(o));
+        }
+        if let Some(o) = &s.opened {
+            if s.unlocked.as_ref().map(|u| u.at_unix) != Some(o.at_unix) {
+                println!("reopened: {}", who(o));
+            }
+        }
     }
     if st.pin_locked_out {
         println!("PIN:      locked out after too many attempts (unlock with gpg)");
@@ -393,6 +427,24 @@ fn daemon(args: &[String]) -> Result<()> {
         }
     }
     let cfg_path = cfg_path.ok_or_else(|| Error::msg("--config is required"))?;
+    // The unit may grant CAP_SYS_PTRACE (ambient) for the /proc helper only:
+    // start it first, then drop every capability before any thread exists,
+    // so neither the broker nor the commands it runs keep it.
+    let caps_before = sys::effective_caps().unwrap_or(0);
+    let procs = match std::env::current_exe()
+        .map_err(Error::from)
+        .and_then(|exe| secret_broker::caller::Helper::spawn(&exe))
+    {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("warning: no /proc helper ({e}); caller details will be partial");
+            None
+        }
+    };
+    sys::drop_all_caps()?;
+    if sys::effective_caps().unwrap_or(0) != 0 {
+        return Err(Error::msg("capabilities still present after dropping them"));
+    }
     if let Err(e) = sys::set_non_dumpable() {
         eprintln!("warning: {e}");
     }
@@ -401,13 +453,20 @@ fn daemon(args: &[String]) -> Result<()> {
     }
     let cfg = config::load(&cfg_path)?;
     let secrets_file = cfg.secrets_file.clone();
-    let srv = server::Server::new(cfg)?;
+    let srv = server::Server::new(cfg, procs)?;
     let (listener, agent) = server::listeners(sock.as_deref(), agent_sock.as_deref())?;
     install_signal_handler(std::sync::Arc::clone(&srv))?;
     eprintln!(
         "secret-broker {VERSION}: {} profiles, secrets file {secrets_file}{}",
         srv.profile_count(),
         if agent.is_some() { ", restricted socket for sandboxes" } else { "" }
+    );
+    srv.audit(
+        secret_broker::audit::Event::new("broker_start", "ok")
+            .field("version", VERSION)
+            .field("profiles", srv.profile_count())
+            .field("restricted_socket", agent.is_some())
+            .field("proc_helper_caps", format!("{caps_before:x}")),
     );
     if let Some(agent) = agent {
         let srv = std::sync::Arc::clone(&srv);

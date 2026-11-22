@@ -173,7 +173,13 @@ let
         inherit (m) service label retries;
       }) pamMethods;
     };
+    audit = {
+      inherit (cfg.audit) enable directory journal;
+      max_file_bytes = cfg.audit.maxFileSize;
+      keep_files = cfg.audit.keepFiles;
+    };
   });
+  auditCfg = cfg.audit;
 in
 {
   options.services.secret-broker = {
@@ -249,6 +255,63 @@ in
       type = types.attrsOf (types.submodule profileModule);
       default = { };
       description = "Allowlisted commands the broker will run with secrets.";
+    };
+
+    callerDetails = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Show and log full details of whoever asks (exe, cwd, argv, parents,
+        systemd unit, login session). The broker can't see your processes
+        (ProtectProc=invisible), so a small helper it starts keeps
+        CAP_SYS_PTRACE to read /proc/<pid>/{exe,cwd,cmdline,stat,cgroup}; the
+        daemon drops every capability right after starting it, and neither
+        the daemon nor the commands it runs keep any. ptrace and
+        process_vm_* stay blocked by the syscall filter. Without this, only
+        the uid/pid (SO_PEERCRED) and the socket are known.
+      '';
+    };
+
+    audit = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Log every session event (unlock, lock, seal/expiry, approvals,
+          refusals, every secret-run with argv/exit code/duration, PIN and
+          dialog changes) with the caller's details, to journald
+          (SYSLOG_IDENTIFIER=secret-broker) and to a hash-chained JSON-lines
+          file. Never secret or environment values. Read it with
+          `secret-broker log`, check it with `secret-broker log verify`.
+        '';
+      };
+      directory = mkOption {
+        type = types.str;
+        default = "/var/log/secret-broker";
+        description = ''
+          Where audit.jsonl lives: owned by agent-secrets, group `group`
+          (read-only for its members), mode 2750. ai-run hides it from sandboxes.
+        '';
+      };
+      maxFileSize = mkOption {
+        type = types.ints.positive;
+        default = 10 * 1024 * 1024;
+        description = "Rotate audit.jsonl when it would grow past this many bytes.";
+      };
+      keepFiles = mkOption {
+        type = types.ints.unsigned;
+        default = 9;
+        description = ''
+          Rotated files to keep (audit.jsonl.1 .. .N); older are deleted. The
+          log uses at most maxFileSize * (keepFiles + 1). The hash chain
+          continues across files.
+        '';
+      };
+      journal = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Also send each entry (with its hash) to journald.";
+      };
     };
 
     memoryDenyWriteExecute = mkOption {
@@ -384,6 +447,13 @@ in
     users.groups.${cfg.group}.members = cfg.users;
 
     environment.systemPackages = [ cfg.package ];
+    # `secret-broker log` reads the file directly (group read).
+    environment.variables.SECRET_BROKER_AUDIT_DIR = lib.mkIf auditCfg.enable auditCfg.directory;
+
+    systemd.tmpfiles.rules = lib.optionals auditCfg.enable [
+      "d ${auditCfg.directory} 2750 agent-secrets ${cfg.group} - -"
+      "z ${auditCfg.directory}/audit.jsonl 0640 agent-secrets ${cfg.group} - -"
+    ];
 
     systemd.sockets.secret-broker = {
       description = "secret-broker socket";
@@ -422,8 +492,10 @@ in
         LimitCORE = 0;
         LimitMEMLOCK = "64M";
         NoNewPrivileges = true;
-        CapabilityBoundingSet = "";
-        AmbientCapabilities = "";
+        # Only for the /proc helper (see callerDetails); the daemon drops it
+        # at start, before it serves anything.
+        CapabilityBoundingSet = if cfg.callerDetails then "CAP_SYS_PTRACE" else "";
+        AmbientCapabilities = if cfg.callerDetails then "CAP_SYS_PTRACE" else "";
         PrivateTmp = true;
         # FIDO2 keys are /dev/hidraw*: only those, through the device cgroup.
         PrivateDevices = !fido2Enabled;
@@ -444,10 +516,11 @@ in
         LockPersonality = true;
         MemoryDenyWriteExecute = cfg.memoryDenyWriteExecute;
         SystemCallArchitectures = "native";
-        SystemCallFilter = [ "@system-service" ];
+        SystemCallFilter = [ "@system-service" "~ptrace process_vm_readv process_vm_writev" ];
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
         KeyringMode = "private";
         RemoveIPC = true;
+        ReadWritePaths = lib.optionals auditCfg.enable [ "-${auditCfg.directory}" ];
       } // cfg.serviceConfig;
     };
 

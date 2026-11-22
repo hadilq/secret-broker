@@ -6,6 +6,8 @@
 //! `clippy` flake check, which fails the build on any violation.
 
 pub mod approve;
+pub mod audit;
+pub mod caller;
 pub mod client;
 pub mod config;
 pub mod error;

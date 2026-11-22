@@ -18,12 +18,15 @@
 //! the PIN or act as the approval dialog.
 
 use crate::approve::{Hw, HwEvent};
+use crate::audit::{Audit, Event};
 use crate::bail;
+use crate::caller;
 use crate::config::{self, Config, Profile};
 use crate::error::{Error, Result};
 use crate::pin;
 use crate::proto::{
-    self, Answer, ExitInfo, ProfileInfo, Prompt, Request, Requester, Response, Status,
+    self, Answer, Caller, ExitInfo, Owner, ProfileInfo, Prompt, Request, Requester, Response,
+    SessionInfo, Status,
 };
 use crate::redact::Redactor;
 use crate::secmem::{self, SecretBuf};
@@ -73,6 +76,10 @@ struct State {
     pin_failures: u32,
     pin_not_before: Option<Instant>,
     pin_locked_out: bool,
+    /// The gpg unlock that loaded the secrets.
+    unlocked_by: Option<Owner>,
+    /// The latest opening (gpg or quick approval).
+    opened_by: Option<Owner>,
 }
 
 impl State {
@@ -84,6 +91,8 @@ impl State {
         self.open_until_unix = 0;
         self.pin_failures = 0;
         self.pin_not_before = None;
+        self.unlocked_by = None;
+        self.opened_by = None;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -120,12 +129,13 @@ enum Incoming {
 /// (prompter) or a terminal running `secret-broker unlock`.
 struct Channel {
     uid: u32,
+    pid: i32,
     writer: Mutex<UnixStream>,
     rx: Mutex<Receiver<Incoming>>,
 }
 
 impl Channel {
-    fn new(stream: &UnixStream, uid: u32) -> Result<Self> {
+    fn new(stream: &UnixStream, uid: u32, pid: i32) -> Result<Self> {
         let mut rd = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || loop {
@@ -155,6 +165,7 @@ impl Channel {
         });
         Ok(Channel {
             uid,
+            pid,
             writer: Mutex::new(stream.try_clone()?),
             rx: Mutex::new(rx),
         })
@@ -201,6 +212,9 @@ pub struct Server {
     pin_path: PathBuf,
     /// Our own binary, for the `pam-check` helper.
     helper: PathBuf,
+    audit: Audit,
+    /// Reads /proc for caller details (see caller.rs); None: read directly.
+    procs: Mutex<Option<caller::Helper>>,
 }
 
 fn lock_state(m: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -243,7 +257,7 @@ fn ok_response() -> Response {
 }
 
 impl Server {
-    pub fn new(cfg: Config) -> Result<Arc<Self>> {
+    pub fn new(cfg: Config, procs: Option<caller::Helper>) -> Result<Arc<Self>> {
         let mut allowed = HashSet::new();
         for name in &cfg.allowed_users {
             allowed
@@ -251,6 +265,7 @@ impl Server {
         }
         let pin_path = Path::new(&cfg.state_dir).join("auth").join("pin");
         let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("secret-broker"));
+        let audit = Audit::open(cfg.audit.clone());
         Ok(Arc::new(Server {
             cfg,
             allowed,
@@ -261,7 +276,92 @@ impl Server {
             next_id: AtomicU64::new(1),
             pin_path,
             helper,
+            audit,
+            procs: Mutex::new(procs),
         }))
+    }
+
+    /// Record an audit entry, with every secret value in memory replaced by
+    /// [REDACTED] in all of its strings (argv, reasons, caller details).
+    /// Must not be called while holding the state lock.
+    pub fn audit(&self, ev: Event) {
+        let ev = {
+            let st = lock_state(&self.state);
+            match st.secrets.as_ref() {
+                Some(sec) if !sec.is_empty() => ev.map_strings(&|s| redact_with(sec, s)),
+                _ => ev,
+            }
+        };
+        self.audit.record(ev);
+    }
+
+    fn redact_str(&self, s: &str) -> String {
+        let st = lock_state(&self.state);
+        match st.secrets.as_ref() {
+            Some(sec) => redact_with(sec, s),
+            None => s.to_string(),
+        }
+    }
+
+    /// Who is on the other end of `stream`, snapshotted now.
+    fn snapshot(&self, stream: &UnixStream, cred: PeerCred, restricted: bool) -> Caller {
+        let pidfd = sys::peer_pidfd(stream.as_raw_fd());
+        let mut c = {
+            let mut h = lock_any(&self.procs);
+            match h.as_mut().and_then(|h| h.query(cred.pid)) {
+                Some(c) => c,
+                None => {
+                    if h.take().is_some() {
+                        log("proc helper went away; reading /proc directly");
+                    }
+                    caller::collect(&caller::Roots::default(), cred.pid)
+                }
+            }
+        };
+        c.pid = cred.pid;
+        c.uid = cred.uid;
+        c.gid = cred.gid;
+        c.user = sys::name_of(cred.uid).unwrap_or_default();
+        c.socket = if restricted { "agent.sock" } else { "broker.sock" }.into();
+        c.sandboxed = restricted;
+        // The caller's own argv can contain a secret (`secret-run p <value>`):
+        // it's shown in the dialog and logged, so redact it like output.
+        c.argv = c.argv.iter().map(|a| self.redact_str(a)).collect();
+        for p in &mut c.parents {
+            p.argv = p.argv.iter().map(|a| self.redact_str(a)).collect();
+        }
+        match pidfd {
+            Some(fd) => {
+                c.verified = sys::pidfd_alive(&fd);
+                if !c.verified {
+                    c.notes
+                        .push("the caller exited during the snapshot; its pid may be reused".into());
+                }
+            }
+            None => c
+                .notes
+                .push("no SO_PEERPIDFD (kernel < 6.5): details are best effort".into()),
+        }
+        c
+    }
+
+    fn session_info(&self) -> Option<SessionInfo> {
+        let st = lock_state(&self.state);
+        let mode = st.mode();
+        if mode == Mode::Cold {
+            return None;
+        }
+        Some(SessionInfo {
+            state: mode.as_str().into(),
+            expires_at_unix: if mode == Mode::Open { st.open_until_unix } else { 0 },
+            unlocked: st.unlocked_by.clone(),
+            opened: st.opened_by.clone(),
+        })
+    }
+
+    /// argv with any secret value in memory replaced by [REDACTED].
+    fn redacted(&self, args: &[String]) -> Vec<String> {
+        args.iter().map(|a| self.redact_str(a)).collect()
     }
 
     pub fn profile_count(&self) -> usize {
@@ -270,8 +370,16 @@ impl Server {
 
     /// Wipe everything (SIGTERM, shutdown).
     pub fn wipe(&self, reason: &str) {
-        lock_state(&self.state).forget();
+        let had = {
+            let mut st = lock_state(&self.state);
+            let had = st.secrets.is_some();
+            st.forget();
+            had
+        };
         log(format!("forgotten ({reason})"));
+        self.audit(
+            Event::new("broker_stop", if had { "wiped" } else { "ok" }).field("reason", reason),
+        );
     }
 
     fn pin_set(&self) -> bool {
@@ -332,6 +440,12 @@ impl Server {
                 "rejected uid {} (pid {}): not in allowed_users",
                 cred.uid, cred.pid
             ));
+            let c = self.snapshot(&stream, cred, restricted);
+            self.audit(
+                Event::new("connect", "refused")
+                    .caller(&c)
+                    .field("reason", "uid not in allowed_users"),
+            );
             let _ = proto::write_json(
                 &mut stream,
                 proto::T_JSON,
@@ -346,12 +460,26 @@ impl Server {
                 return;
             }
         };
-        let privileged = matches!(req.op.as_str(), "unlock" | "approve" | "set_pin" | "prompter");
+        // Snapshot the caller now (not for status: it's frequent and harmless).
+        let caller = if req.op == "status" {
+            Caller::default()
+        } else {
+            self.snapshot(&stream, cred, restricted)
+        };
+        let privileged = matches!(
+            req.op.as_str(),
+            "unlock" | "approve" | "set_pin" | "prompter" | "report"
+        );
         if restricted && privileged {
             log(format!(
                 "refused {} from the restricted socket (uid {}, pid {})",
                 req.op, cred.uid, cred.pid
             ));
+            self.audit(
+                Event::new(&audit_op(&req.op), "refused")
+                    .caller(&caller)
+                    .field("reason", "not allowed from the sandbox socket (agent.sock)"),
+            );
             let _ = proto::write_json(
                 &mut stream,
                 proto::T_JSON,
@@ -377,11 +505,11 @@ impl Server {
                 )
             }
             "lock" => {
-                self.lock(req.forget, &format!("uid {} pid {}", cred.uid, cred.pid));
+                self.lock(req.forget, &caller);
                 proto::write_json(&mut stream, proto::T_JSON, &ok_response())
             }
             "unlock" => {
-                let resp = match self.unlock(&mut stream, req.ttl_seconds, cred) {
+                let resp = match self.unlock(&mut stream, req.ttl_seconds, &caller) {
                     Ok(()) => Response {
                         ok: true,
                         error: String::new(),
@@ -392,13 +520,19 @@ impl Server {
                             "unlock by uid {} (pid {}) failed: {e}",
                             cred.uid, cred.pid
                         ));
+                        self.audit(
+                            Event::new("unlock", "failed")
+                                .caller(&caller)
+                                .field("method", "gpg")
+                                .field("reason", e.to_string()),
+                        );
                         Response::err(e.to_string())
                     }
                 };
                 proto::write_json(&mut stream, proto::T_JSON, &resp)
             }
             "set_pin" => {
-                let resp = match self.set_pin(&mut stream, &req, cred) {
+                let resp = match self.set_pin(&mut stream, &req, &caller) {
                     Ok(()) => Response {
                         ok: true,
                         error: String::new(),
@@ -406,13 +540,18 @@ impl Server {
                     },
                     Err(e) => {
                         log(format!("set_pin by uid {} failed: {e}", cred.uid));
+                        self.audit(
+                            Event::new(if req.forget { "remove_pin" } else { "set_pin" }, "failed")
+                                .caller(&caller)
+                                .field("reason", e.to_string()),
+                        );
                         Response::err(e.to_string())
                     }
                 };
                 proto::write_json(&mut stream, proto::T_JSON, &resp)
             }
             "approve" => {
-                let resp = match self.approve_here(&stream, &req, cred) {
+                let resp = match self.approve_here(&stream, &req, &caller) {
                     Ok(()) => Response {
                         ok: true,
                         error: String::new(),
@@ -424,12 +563,19 @@ impl Server {
             }
             "prompter" => {
                 // The connection stays open; the dialog answers requests on it.
-                match self.register_prompter(&mut stream, cred) {
+                match self.register_prompter(&mut stream, &caller) {
                     Ok(()) => return,
                     Err(e) => Err(e),
                 }
             }
-            "exec" => self.exec(stream.try_clone(), &mut stream, &req, cred, restricted),
+            "exec" => self.exec(stream.try_clone(), &mut stream, &req, &caller),
+            "report" => {
+                let resp = match self.report(&req, &caller) {
+                    Ok(()) => ok_response(),
+                    Err(e) => Response::err(e.to_string()),
+                };
+                proto::write_json(&mut stream, proto::T_JSON, &resp)
+            }
             _ => proto::write_json(&mut stream, proto::T_JSON, &Response::err("unknown op")),
         };
         if let Err(e) = result {
@@ -457,6 +603,7 @@ impl Server {
             pin_attempts_left: pcfg.max_attempts.saturating_sub(st.pin_failures),
             restricted,
             approval_timeout_seconds: self.cfg.approval.timeout_seconds,
+            session: None,
             ..Default::default()
         };
         if mode != Mode::Cold {
@@ -489,24 +636,48 @@ impl Server {
                 unresolved,
             });
         }
+        drop(st);
+        out.session = self.session_info();
         out
     }
 
+    /// `report`: something the client did itself, for the audit log.
+    fn report(&self, req: &Request, caller: &Caller) -> Result<()> {
+        if req.event != "fido2_enroll" {
+            bail!("unknown report event {:?}", req.event);
+        }
+        let mut ev = Event::new(&req.event, "reported").caller(caller);
+        for (k, v) in req.details.iter().take(8) {
+            let k = sanitize(k, 32);
+            if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                ev = ev.field(&k, sanitize(v, 300));
+            }
+        }
+        self.audit(ev);
+        Ok(())
+    }
+
     /// `lock`: seal (or forget when no quick method could reopen it).
-    fn lock(self: &Arc<Self>, forget: bool, who: &str) {
+    fn lock(self: &Arc<Self>, forget: bool, caller: &Caller) {
+        let who = format!("uid {} pid {}", caller.uid, caller.pid);
+        let ev = |outcome: &str| Event::new("lock", outcome).caller(caller).field("forget", forget);
         let mut st = lock_state(&self.state);
         if st.secrets.is_none() {
+            drop(st);
+            self.audit(ev("noop").field("reason", "already cold"));
             return;
         }
         if forget || !self.can_seal() {
             st.forget();
             drop(st);
             log(format!("forgotten (lock by {who})"));
+            self.audit(ev("wiped"));
         } else {
             st.seal();
             let gen = st.generation;
             drop(st);
             log(format!("sealed (lock by {who})"));
+            self.audit(ev("sealed"));
             self.schedule_forget(gen);
         }
     }
@@ -518,7 +689,7 @@ impl Server {
     }
 
     /// Open the session for `ttl_secs` and arm the expiry timer.
-    fn open(self: &Arc<Self>, ttl_secs: u64) -> Result<()> {
+    fn open(self: &Arc<Self>, ttl_secs: u64, by: Option<Owner>) -> Result<()> {
         let ttl_dur = Duration::from_secs(ttl_secs);
         let until = Instant::now()
             .checked_add(ttl_dur)
@@ -529,6 +700,12 @@ impl Server {
                 bail!("secrets are no longer in memory; unlock with gpg");
             }
             st.open_until = Some(until);
+            if let Some(o) = by {
+                if o.method == "gpg" {
+                    st.unlocked_by = Some(o.clone());
+                }
+                st.opened_by = Some(o);
+            }
             st.open_until_unix =
                 i64::try_from(now_unix().saturating_add(ttl_secs)).unwrap_or(i64::MAX);
             st.generation = st.generation.wrapping_add(1);
@@ -546,11 +723,13 @@ impl Server {
                 let gen = st.generation;
                 drop(st);
                 log("sealed (ttl expired)");
+                srv.audit(Event::new("expire", "sealed").field("reason", "ttl"));
                 srv.schedule_forget(gen);
             } else {
                 st.forget();
                 drop(st);
                 log("forgotten (ttl expired)");
+                srv.audit(Event::new("expire", "wiped").field("reason", "ttl, no quick method configured"));
             }
         });
         Ok(())
@@ -570,12 +749,13 @@ impl Server {
                 st.forget();
                 drop(st);
                 log("forgotten (sealed too long)");
+                srv.audit(Event::new("expire", "wiped").field("reason", "sealed longer than sealedTimeout"));
             }
         });
     }
 
     /// Verify the sops data key against the secrets file and load it.
-    fn load_with_key(self: &Arc<Self>, key: &[u8], ttl_secs: u64) -> Result<usize> {
+    fn load_with_key(self: &Arc<Self>, key: &[u8], ttl_secs: u64, by: Owner) -> Result<usize> {
         let path = Path::new(&self.cfg.secrets_file);
         config::check_trusted(path).map_err(|e| e.context("untrusted secrets file"))?;
         let doc = std::fs::read(path).map_err(|e| Error::from(e).context(path.display()))?;
@@ -594,7 +774,7 @@ impl Server {
             st.pepper = Some(pepper);
             st.pin_locked_out = false;
         }
-        self.open(ttl_secs)?;
+        self.open(ttl_secs, Some(by))?;
         if secmem::mlock_failed() {
             log("warning: mlock failed; secrets may be swapped (raise LimitMEMLOCK)");
         }
@@ -614,21 +794,29 @@ impl Server {
         self: &Arc<Self>,
         stream: &mut UnixStream,
         ttl: Option<u64>,
-        cred: PeerCred,
+        caller: &Caller,
     ) -> Result<()> {
         let key = Self::read_key(stream)?;
         let ttl_secs = self.ttl_secs(ttl);
-        let count = self.load_with_key(&key, ttl_secs)?;
+        let owner = Owner::from_caller(caller, "gpg", "gpg", sys::now_unix_i64());
+        let count = self.load_with_key(&key, ttl_secs, owner)?;
         log(format!(
             "unlocked with gpg by uid {} (pid {}) for {ttl_secs}s, {count} values",
-            cred.uid, cred.pid
+            caller.uid, caller.pid
         ));
+        self.audit(
+            Event::new("unlock", "ok")
+                .caller(caller)
+                .field("method", "gpg")
+                .field("ttl_seconds", ttl_secs)
+                .field("secret_count", count),
+        );
         Ok(())
     }
 
     /// Set or remove the PIN. Requires the gpg-unwrapped data key, which also
     /// unlocks the session.
-    fn set_pin(self: &Arc<Self>, stream: &mut UnixStream, req: &Request, cred: PeerCred) -> Result<()> {
+    fn set_pin(self: &Arc<Self>, stream: &mut UnixStream, req: &Request, caller: &Caller) -> Result<()> {
         let pcfg = &self.cfg.approval.pin;
         if !pcfg.enable {
             bail!("PIN approval is disabled in the broker config");
@@ -645,11 +833,20 @@ impl Server {
             Some(p)
         };
         let ttl_secs = self.ttl_secs(req.ttl_seconds);
-        self.load_with_key(&key, ttl_secs)?;
+        let owner = Owner::from_caller(caller, "gpg", "gpg", sys::now_unix_i64());
+        self.load_with_key(&key, ttl_secs, owner)?;
+        self.audit(
+            Event::new("unlock", "ok")
+                .caller(caller)
+                .field("method", "gpg")
+                .field("ttl_seconds", ttl_secs)
+                .field("reason", "set-pin"),
+        );
         match new_pin {
             None => {
                 pin::remove(&self.pin_path)?;
-                log(format!("PIN removed by uid {}", cred.uid));
+                log(format!("PIN removed by uid {}", caller.uid));
+                self.audit(Event::new("remove_pin", "ok").caller(caller));
             }
             Some(p) => {
                 if p.len() < pcfg.min_length {
@@ -658,23 +855,29 @@ impl Server {
                 let pep = pin::pepper(&key);
                 let rec = pin::Record::create(&p, &pep[..], pcfg.cost(), &req.phrase)?;
                 pin::save(&self.pin_path, &rec)?;
-                log(format!("PIN set by uid {}", cred.uid));
+                log(format!("PIN set by uid {}", caller.uid));
+                self.audit(Event::new("set_pin", "ok").caller(caller));
             }
         }
         Ok(())
     }
 
-    fn register_prompter(self: &Arc<Self>, stream: &mut UnixStream, cred: PeerCred) -> Result<()> {
-        let ch = Arc::new(Channel::new(stream, cred.uid)?);
+    fn register_prompter(self: &Arc<Self>, stream: &mut UnixStream, caller: &Caller) -> Result<()> {
+        let ch = Arc::new(Channel::new(stream, caller.uid, caller.pid)?);
         proto::write_json(stream, proto::T_JSON, &ok_response())?;
         let old = lock_any(&self.prompter).replace(ch);
+        self.audit(
+            Event::new("prompter_register", "ok")
+                .caller(caller)
+                .field("replaced", old.is_some()),
+        );
         if let Some(old) = old {
             let w = lock_any(&old.writer);
             let _ = w.shutdown(std::net::Shutdown::Both);
         }
         log(format!(
             "approval dialog registered (uid {}, pid {})",
-            cred.uid, cred.pid
+            caller.uid, caller.pid
         ));
         Ok(())
     }
@@ -685,7 +888,7 @@ impl Server {
     }
 
     /// For exec: if sealed, ask the registered dialog for a quick approval.
-    fn ensure_open(self: &Arc<Self>, req: &Request, cred: PeerCred, restricted: bool) -> Result<()> {
+    fn ensure_open(self: &Arc<Self>, req: &Request, args: &[String], caller: &Caller) -> Result<()> {
         match self.mode() {
             Mode::Open => return Ok(()),
             Mode::Cold => bail!(
@@ -707,45 +910,33 @@ impl Server {
             );
         };
         let mut purpose = format!("secret-run {}", req.profile);
-        for a in &req.args {
+        for a in args {
             purpose.push(' ');
             purpose.push_str(a);
         }
-        let who = Requester {
-            pid: cred.pid,
-            uid: cred.uid,
-            user: sys::name_of(cred.uid).unwrap_or_default(),
-            sandboxed: restricted,
-        };
-        let method = self.run_approval(&ch, who, &sanitize(&purpose, 300), None)?;
+        let method = self.run_approval(&ch, caller, &sanitize(&purpose, 300), None, "dialog")?;
         log(format!(
             "session approved via {method} for exec by uid {} (pid {}{})",
-            cred.uid,
-            cred.pid,
-            if restricted { ", sandboxed" } else { "" }
+            caller.uid,
+            caller.pid,
+            if caller.sandboxed { ", sandboxed" } else { "" }
         ));
         Ok(())
     }
 
     /// `secret-broker unlock` on a sealed session: the terminal is the dialog.
-    fn approve_here(self: &Arc<Self>, stream: &UnixStream, req: &Request, cred: PeerCred) -> Result<()> {
+    fn approve_here(self: &Arc<Self>, stream: &UnixStream, req: &Request, caller: &Caller) -> Result<()> {
         let _gate = lock_any(&self.gate);
         match self.mode() {
             Mode::Open => return Ok(()),
             Mode::Cold => bail!("secrets are not in memory; unlock with gpg"),
             Mode::Sealed => {}
         }
-        let ch = Channel::new(stream, cred.uid)?;
-        let who = Requester {
-            pid: cred.pid,
-            uid: cred.uid,
-            user: sys::name_of(cred.uid).unwrap_or_default(),
-            sandboxed: false,
-        };
-        let method = self.run_approval(&ch, who, "secret-broker unlock", req.ttl_seconds)?;
+        let ch = Channel::new(stream, caller.uid, caller.pid)?;
+        let method = self.run_approval(&ch, caller, "secret-broker unlock", req.ttl_seconds, "terminal")?;
         log(format!(
             "session approved via {method} in a terminal by uid {} (pid {})",
-            cred.uid, cred.pid
+            caller.uid, caller.pid
         ));
         Ok(())
     }
@@ -809,6 +1000,10 @@ impl Server {
             st.pin_locked_out = true;
             drop(st);
             log("too many wrong PINs: secrets forgotten");
+            self.audit(
+                Event::new("pin_lockout", "wiped")
+                    .field("reason", format!("{max} wrong PINs; gpg needed again")),
+            );
             return PinCheck::Fatal(
                 "Too many wrong PINs: secrets wiped from memory. Unlock with gpg (`secret-broker unlock`)."
                     .into(),
@@ -818,6 +1013,7 @@ impl Server {
         st.pin_not_before = Instant::now().checked_add(pin::backoff(st.pin_failures));
         drop(st);
         log(format!("wrong PIN ({left} attempts left)"));
+        self.audit(Event::new("pin_wrong", "failed").field("attempts_left", left));
         PinCheck::Wrong(format!("Wrong PIN, {left} attempts left"))
     }
 
@@ -825,14 +1021,30 @@ impl Server {
     fn run_approval(
         self: &Arc<Self>,
         ch: &Channel,
-        who: Requester,
+        caller: &Caller,
         purpose: &str,
         ttl: Option<u64>,
+        via: &str,
     ) -> Result<String> {
         let (methods, phrase, attempts_left) = self.available_methods();
+        let ev = |outcome: &str| {
+            Event::new("approval", outcome)
+                .caller(caller)
+                .field("via", via)
+                .field("purpose", purpose)
+                .field("approver_uid", ch.uid)
+                .field("approver_pid", ch.pid)
+        };
         if methods.is_empty() {
+            self.audit(ev("failed").field("reason", "no quick approval method available"));
             bail!("no quick approval method available; unlock with gpg");
         }
+        let who = Requester {
+            pid: caller.pid,
+            uid: caller.uid,
+            user: caller.user.clone(),
+            sandboxed: caller.sandboxed,
+        };
         let a = &self.cfg.approval;
         let ttl_secs = self.ttl_secs(ttl);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -861,6 +1073,8 @@ impl Server {
             phrase,
             attempts_left,
             timeout_seconds: a.timeout_seconds,
+            caller: Some(caller.clone()),
+            session: self.session_info(),
             ..Default::default()
         })?;
         let update = |msg: String| {
@@ -874,8 +1088,10 @@ impl Server {
         let start = Instant::now();
         let rx = lock_any(&ch.rx);
         let mut denied = false;
+        let mut kind = "failed";
         let outcome: std::result::Result<String, String> = 'wait: loop {
             if start.elapsed() >= timeout {
+                kind = "timeout";
                 break 'wait Err("approval timed out".into());
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -892,9 +1108,11 @@ impl Server {
                 }
                 Ok(Incoming::Deny(aid)) if aid == id => {
                     denied = true;
+                    kind = "denied";
                     break 'wait Err("denied in the approval dialog".into());
                 }
                 Ok(Incoming::Unavailable(aid)) if aid == id => {
+                    kind = "unavailable";
                     break 'wait Err(
                         "the approval dialog could not open a window; run `secret-broker unlock` in a terminal"
                             .into(),
@@ -914,7 +1132,14 @@ impl Server {
         };
         drop(rx);
         drop(hw);
-        let outcome = outcome.and_then(|m| self.open(ttl_secs).map(|()| m).map_err(|e| e.to_string()));
+        let outcome = outcome.and_then(|m| {
+            let owner = Owner::from_caller(caller, &m, via, sys::now_unix_i64());
+            self.open(ttl_secs, Some(owner)).map(|()| m).map_err(|e| e.to_string())
+        });
+        match &outcome {
+            Ok(m) => self.audit(ev("granted").field("method", m.as_str()).field("ttl_seconds", ttl_secs)),
+            Err(e) => self.audit(ev(kind).field("reason", e.as_str())),
+        }
         let (ok, message) = match &outcome {
             Ok(m) => (true, format!("Approved ({m})")),
             Err(e) => (false, e.clone()),
@@ -937,14 +1162,24 @@ impl Server {
         reader: std::io::Result<UnixStream>,
         stream: &mut UnixStream,
         req: &Request,
-        cred: PeerCred,
-        restricted: bool,
+        caller: &Caller,
     ) -> Result<()> {
+        // argv as logged/shown: secret values replaced.
+        let args = self.redacted(&req.args);
         let deny = |stream: &mut UnixStream, msg: String| -> Result<()> {
+            // Policy messages quote the arguments.
+            let msg = self.redact_str(&msg);
             log(format!(
                 "exec by uid {} (pid {}) profile {:?} denied: {msg}",
-                cred.uid, cred.pid, req.profile
+                caller.uid, caller.pid, req.profile
             ));
+            self.audit(
+                Event::new("exec", "refused")
+                    .caller(caller)
+                    .field("profile", req.profile.as_str())
+                    .field("args", args.clone())
+                    .field("reason", msg.as_str()),
+            );
             proto::write_json(stream, proto::T_JSON, &Response::err(msg))
         };
         let Some(p) = self.cfg.profiles.get(&req.profile) else {
@@ -961,7 +1196,7 @@ impl Server {
         }
 
         // A sealed session needs a quick approval in the dialog first.
-        if let Err(e) = self.ensure_open(req, cred, restricted) {
+        if let Err(e) = self.ensure_open(req, &args, caller) {
             return deny(stream, e.to_string());
         }
 
@@ -995,10 +1230,19 @@ impl Server {
             Err(e) => return deny(stream, format!("start: {e}")),
         };
         let pid = child.id();
+        let started = Instant::now();
         log(format!(
-            "exec by uid {} (pid {}): profile {:?} args {:?} -> pid {pid}",
-            cred.uid, cred.pid, req.profile, req.args
+            "exec by uid {} (pid {}): profile {:?} -> pid {pid}",
+            caller.uid, caller.pid, req.profile
         ));
+        let exec_ev = |outcome: &str| {
+            Event::new(if outcome == "started" { "exec_start" } else { "exec_end" }, outcome)
+                .caller(caller)
+                .field("profile", req.profile.as_str())
+                .field("args", args.clone())
+                .field("child_pid", pid)
+        };
+        self.audit(exec_ev("started"));
 
         let done = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
@@ -1103,6 +1347,13 @@ impl Server {
         if timed_out.load(Ordering::SeqCst) {
             info.error = "timeout".into();
         }
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.audit(
+            exec_ev(if info.code == 0 { "ok" } else { "failed" })
+                .field("exit_code", info.code)
+                .field("duration_ms", duration_ms)
+                .opt("error", &info.error),
+        );
         proto::write_json(&mut *lock_writer(&writer), proto::T_EXIT, &info)?;
         log(format!(
             "exec pid {pid} (profile {:?}) exited {}",
@@ -1110,6 +1361,44 @@ impl Server {
         ));
         Ok(())
     }
+}
+
+/// Audit event name for a request op.
+fn audit_op(op: &str) -> String {
+    match op {
+        "unlock" | "approve" => "unlock".into(),
+        "prompter" => "prompter_register".into(),
+        other => sanitize(other, 32),
+    }
+}
+
+fn redact_with(secrets: &HashMap<String, SecretBuf>, s: &str) -> String {
+    let mut b = s.as_bytes().to_vec();
+    for v in secrets.values() {
+        b = replace_all(&b, v.as_bytes(), b"[REDACTED]");
+    }
+    String::from_utf8_lossy(&b).into_owned()
+}
+
+/// Replace every occurrence of `needle` (if at least 4 bytes) in `hay`.
+fn replace_all(hay: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    if needle.len() < 4 || hay.len() < needle.len() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0usize;
+    while i < hay.len() {
+        if hay.get(i..i.saturating_add(needle.len())) == Some(needle) {
+            out.extend_from_slice(with);
+            i = i.saturating_add(needle.len());
+        } else {
+            if let Some(b) = hay.get(i) {
+                out.push(*b);
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    out
 }
 
 fn lock_writer(w: &Mutex<UnixStream>) -> MutexGuard<'_, UnixStream> {
@@ -1211,6 +1500,12 @@ pub fn listeners(
         // listening unix sockets (LISTEN_PID matches); we take ownership of
         // each exactly once.
         let main = unsafe { UnixListener::from_raw_fd(3) };
+        // systemd passes them without FD_CLOEXEC: profile commands must not
+        // inherit the broker's listening sockets.
+        sys::set_cloexec(3)?;
+        if fds >= 2 {
+            sys::set_cloexec(4)?;
+        }
         let agent = if fds >= 2 {
             // SAFETY: as above.
             Some(unsafe { UnixListener::from_raw_fd(4) })

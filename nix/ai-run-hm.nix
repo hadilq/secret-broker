@@ -223,6 +223,8 @@ in
         # secret-broker's full socket (unlock, approve, PIN, dialog); sandboxes
         # use the restricted socket instead (see `env`)
         "/run/secret-broker/broker.sock"
+        # the broker's audit log (who unlocked/ran what): yours to read, not the agent's
+        "/var/log/secret-broker"
       ];
     };
     extraMask = mkOption { type = types.listOf types.str; default = [ ]; };

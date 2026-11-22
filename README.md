@@ -209,6 +209,7 @@ secret-broker status            # state, expiry, profiles, allow rules (never va
 secret-run gh pr list           # agent-facing; exit code is the child's
 secret-broker lock              # seal (PIN/key to reopen); --forget wipes
 secret-broker set-pin           # quick approval PIN (see below)
+secret-broker log               # who unlocked / locked / ran what (see Audit log)
 ```
 
 Exit codes: the child's own, `126` refused (locked / not allowlisted /
@@ -262,10 +263,40 @@ A ~1.2 MB Wayland layer-shell client (smithay-client-toolkit + fontdue,
 software rendering into wl_shm, links only libxkbcommon and libc). It works on
 any compositor with `wlr-layer-shell` (Hyprland, sway, river, niri, KDE…):
 an overlay layer surface with **exclusive keyboard**, centred, and no pointer
-input, so a click can't approve. It shows who asked (command, pid, parent chain,
-whether it runs inside ai-run), what will run, how long it opens for, your
-phrase, a PIN field, and hints for a key touch or fingerprint. It's themed from
+input, so a click can't approve. It's themed from
 `~/.local/state/omarchy/current/theme/colors.toml`.
+
+Up top: who asked (command, pid), the app it runs in (`foot (via Hyprland)`,
+from the systemd unit), whether it's in an ai-run sandbox and which profile,
+which socket it came on, what will run, how long the session opens for, who
+unlocked the session (time, user, method, app), your phrase, the PIN field
+and hints for a key touch or fingerprint.
+
+**Tab** shows the full picture, scrolled with ↑ ↓ PgUp PgDn Home End (no mouse):
+uid/gid/user, pid (and whether it is still the same process), full argv, exe
+(store path), cwd, socket, ai-run profile, systemd unit and cgroup, logind
+session/seat/type, tty, audit session id, the parent chain (pid, comm, exe,
+argv of each), the session's state, who unlocked it with gpg and who last
+reopened it (method, via dialog/terminal, app, socket), the snapshot time and
+any caveats.
+
+All of it is gathered **by the broker** when the request arrives, not by the
+dialog. The broker itself can't see your processes (ProtectProc=invisible), so
+at start it spawns `secret-broker proc-helper`, which keeps CAP_SYS_PTRACE only
+to read `/proc/<pid>/{exe,cwd,cmdline,stat,status,cgroup,sessionid}` (never
+`environ` or memory), and then the daemon drops every capability before
+serving anything. Commands it runs get none (the VM test checks CapEff). Turn
+this off with `services.secret-broker.callerDetails = false` (then only uid,
+pid and socket are known).
+
+Limits: a pid is only a name. The broker pins the caller with a pidfd
+(SO_PEERPIDFD, Linux ≥ 6.5) and marks the snapshot *verified* only if that
+same process is still alive after it was read, so a reused pid can't slip in.
+Parents aren't pinned: one may exit and its pid be reused (the chain stops
+where a "parent" started after its child). The ai-run profile comes from
+bwrap's command line, which anything can fake: trust the *socket* (agent.sock
+means "came from a sandbox"), treat the rest as a description. Any secret value
+that shows up in argv is shown and logged as [REDACTED].
 
 Why not iced/GTK/Qt: on this nixpkgs, pinentry-qt's closure is ~753 MiB and
 pinentry-gnome3's ~365 MiB. iced needs wgpu/tiny-skia + winit, so it's a few
@@ -304,6 +335,70 @@ a fake dialog, answer approvals, or change the PIN.
 * Hyprland (optional): `ecosystem:enforce_permissions` with a screencopy deny
   for agents, and `layerrule = noscreenshare, secret-broker`, keep the dialog
   out of screenshots. This isn't enabled; check it against your Hyprland version.
+
+## Audit log
+
+Every session event is logged with who caused it:
+
+| event | outcome | when |
+|---|---|---|
+| `broker_start` / `broker_stop` | ok / wiped | daemon start, SIGTERM (wipes) |
+| `unlock` | ok / failed / refused | gpg unlock (`method=gpg`), also via `set-pin`; refused from the sandbox socket |
+| `approval` | granted / denied / timeout / unavailable / failed | quick approval of a sealed session (`method=pin\|fido2\|<pam name>`, `via=dialog\|terminal`, `purpose`) |
+| `pin_wrong` | failed | wrong PIN (`attempts_left`) |
+| `pin_lockout` | wiped | too many wrong PINs: secrets wiped |
+| `lock` | sealed / wiped / noop | `secret-broker lock` (`forget` true for `--forget`) |
+| `expire` | sealed / wiped | TTL ran out; `sealedTimeout` |
+| `exec_start`, `exec_end` | started; ok / failed | every `secret-run`: `profile`, `args`, `child_pid`, `exit_code`, `duration_ms`, `error` |
+| `exec` | refused | unknown profile, not allowlisted, locked, approval denied… (`reason`) |
+| `set_pin`, `remove_pin` | ok / failed / refused | |
+| `prompter_register` | ok / refused | an approval dialog connected (`replaced`: it took over from another) |
+| `fido2_enroll` | reported | `secret-broker fido2-enroll` (client-side, reported to the broker) |
+
+Each entry has `seq`, `ts` (UTC) and `ts_unix_ms`, and, except for timer
+events, `caller`: the same snapshot the dialog shows (uid/user, pid, exe, cwd,
+argv, parents, cgroup/unit/app, login session, tty, socket, ai-run profile,
+verified). **Never** secret values, environment values or PINs. argv and
+messages are logged with every secret value in memory replaced by
+`[REDACTED]` (when the session is cold there's nothing to compare against).
+
+Where:
+
+* **journald**: `journalctl SYSLOG_IDENTIFIER=secret-broker AUDIT_EVENT=approval`.
+  Fields: AUDIT_EVENT, AUDIT_OUTCOME, AUDIT_SEQ, AUDIT_HASH, AUDIT_PREV,
+  AUDIT_METHOD, AUDIT_PROFILE, AUDIT_SOCKET, AUDIT_SANDBOX_PROFILE, CALLER_UID,
+  CALLER_USER, CALLER_PID, CALLER_EXE, CALLER_CWD, CALLER_UNIT,
+  CALLER_SESSION, and the whole entry in AUDIT_JSON.
+* **`/var/log/secret-broker/audit.jsonl`**: one JSON object per line. The
+  directory is `2750 agent-secrets:secret-broker` and the file is `0640`, so
+  members of the `secret-broker` group (you) can read it but not change,
+  delete or rename it. ai-run hides the directory from sandboxes, and there is
+  no socket operation that reads the log. Rotated by size into
+  `audit.jsonl.1 … .N` (`audit.maxFileSize`, default 10 MiB; `audit.keepFiles`,
+  default 9).
+
+```sh
+secret-broker log                      # everything, local time, one line each
+secret-broker log -f                   # follow
+secret-broker log --since 2h --event unlock,approval,lock
+secret-broker log --event 'exec*' -n 20 --json
+secret-broker log verify               # hash chain
+sudo secret-broker log verify --journal  # ... and against journald's copy
+secret-broker log head                 # latest seq + hash, to note somewhere else
+```
+
+**Tamper evidence.** Each line carries `prev`, the SHA-256 of the line before
+(64 zeros for the first ever), and the chain runs across rotations. Changing,
+inserting or deleting a line breaks it at the next one, and `log verify` says
+where. root can rewrite the whole file with a consistent chain, but every
+entry's hash also went to journald when it was written, so `log verify
+--journal` catches that (the VM test does exactly this). For stronger
+guarantees, enable journald sealing (`journalctl --setup-keys`) or ship the
+journal off the machine, and note `log head` now and then. Deleting the newest
+lines is only visible against the journal or an older `log head`.
+
+Options: `services.secret-broker.audit.{enable,directory,maxFileSize,keepFiles,journal}`
+(enabled by default).
 
 ## ai-run: sandbox the agent, not just the secrets
 
@@ -402,16 +497,19 @@ Dependencies, kept small on purpose:
 | crate | why |
 |---|---|
 | `aes-gcm` (no default features; `aes`, `zeroize`) | sops values are AES-256-GCM with a 32-byte nonce; RustCrypto, constant-time, zeroizes key schedules |
-| `sha2` | the sops MAC is SHA-512 over the plaintext values |
+| `sha2` | the sops MAC is SHA-512 over the plaintext values; SHA-256 for the PIN pepper, FIDO2 challenges and the audit hash chain |
 | `base64` | sops encodes data/iv/tag in base64 |
 | `serde`, `serde_json` (`preserve_order`) | protocol, config and the sops file; document order is needed to recompute the MAC |
 | `regex` (`std` only) | sops `encrypted_regex` / `unencrypted_regex` rules |
 | `zeroize` | wipe keys and temporary secret copies on drop |
-| `libc` | `mlock`, `madvise(MADV_DONTDUMP)`, `prctl(PR_SET_DUMPABLE, 0)`, `setrlimit(RLIMIT_CORE, 0)`, `SO_PEERCRED`, `getpwnam_r`, `killpg` |
+| `libc` | `mlock`, `madvise(MADV_DONTDUMP)`, `prctl(PR_SET_DUMPABLE, 0)`, `setrlimit(RLIMIT_CORE, 0)`, `SO_PEERCRED`, `SO_PEERPIDFD`/`pidfd_send_signal`, `capset`, `getpwnam_r`, `killpg` |
 
 `ai-run` (`src/sandbox.rs` plans the bwrap command line and is unit tested,
 `src/bin/ai-run.rs` starts `xdg-dbus-proxy` with a sync pipe and execs bwrap)
-uses no extra crates.
+uses no extra crates. Caller snapshots are `src/caller.rs` (plus the
+`proc-helper` subcommand), the audit log and `secret-broker log` are
+`src/audit.rs`; both unit tested, and end to end in `tests/broker.rs` and the
+VM test.
 
 No async runtime, CLI parser or error crate: a thread per connection, a
 hand-written argument parser and one `Error` enum (`src/error.rs`).

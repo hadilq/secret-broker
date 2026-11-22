@@ -37,6 +37,7 @@ pub struct Config {
     pub gpg_cache_limits: GpgCacheLimits,
     pub profiles: BTreeMap<String, Profile>,
     pub approval: Approval,
+    pub audit: crate::audit::AuditConfig,
 }
 
 /// Quick approval of a sealed session (secrets already in memory).
@@ -163,6 +164,7 @@ impl Default for Config {
             },
             profiles: BTreeMap::new(),
             approval: Approval::default(),
+            audit: crate::audit::AuditConfig::default(),
         }
     }
 }

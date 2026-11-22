@@ -522,10 +522,34 @@ pub fn fido2_enroll(device: Option<&str>, name: &str, rp: &str) -> Result<String
     if !pem.first().is_some_and(|l| l.contains("BEGIN PUBLIC KEY")) {
         bail!("fido2-cred -V printed no public key");
     }
+    if let Err(e) = report(
+        "fido2_enroll",
+        &[("name", name), ("rp", rp), ("credential_id", &id), ("device", &dev)],
+    ) {
+        eprintln!("note: could not record the enrollment in the audit log: {e}");
+    }
     Ok(format!(
         "  services.secret-broker.approval.fido2.credentials = [\n    {{\n      name = \"{name}\";\n      id = \"{id}\";\n      publicKey = ''\n{}\n      '';\n    }}\n  ];\n",
         pem.iter().map(|l| format!("        {l}")).collect::<Vec<_>>().join("\n")
     ))
+}
+
+/// Tell the broker about something done client-side (audit log only).
+pub fn report(event: &str, details: &[(&str, &str)]) -> Result<()> {
+    let req = Request {
+        op: "report".into(),
+        event: event.into(),
+        details: details
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let r = round_trip(&req, None)?;
+    if !r.ok {
+        bail!("{}", r.error);
+    }
+    Ok(())
 }
 
 fn pipe_through(cmd: &mut Command, input: &[u8]) -> Result<Vec<u8>> {
