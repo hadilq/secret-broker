@@ -173,3 +173,81 @@ pub fn local_time(unix: i64) -> String {
         zone
     )
 }
+
+/// Home directory of a uid from the passwd database (not $HOME, which the
+/// caller controls).
+pub fn home_of(uid: u32) -> Result<std::path::PathBuf> {
+    let mut pwd: libc::passwd = {
+        // SAFETY: passwd is a plain C struct; all-zero is a valid (empty) value.
+        unsafe { std::mem::zeroed() }
+    };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call; buf outlives the call and
+    // `pwd` only borrows from it while we copy pw_dir below.
+    let r = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if r != 0 {
+        bail!(
+            "getpwuid_r({uid}): {}",
+            std::io::Error::from_raw_os_error(r)
+        );
+    }
+    if result.is_null() || pwd.pw_dir.is_null() {
+        bail!("no passwd entry for uid {uid}");
+    }
+    // SAFETY: pw_dir points into `buf`, NUL-terminated by libc.
+    let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        dir.to_bytes(),
+    )))
+}
+
+/// pipe2(O_CLOEXEC): (read end, write end).
+pub fn pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: fds is a valid 2-element array.
+    let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if r != 0 {
+        return Err(last_os_error("pipe2"));
+    }
+    let [rd, wr] = fds;
+    // SAFETY: pipe2 succeeded, so both are fresh descriptors we now own.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(rd),
+            std::os::fd::OwnedFd::from_raw_fd(wr),
+        )
+    })
+}
+
+/// Clear FD_CLOEXEC so `fd` survives exec. Async-signal-safe (used in pre_exec).
+pub fn clear_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl on an integer descriptor takes no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let r = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether a pid exists in our pid namespace.
+pub fn pid_alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 only checks for existence/permission.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}

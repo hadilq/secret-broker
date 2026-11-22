@@ -12,6 +12,7 @@ pub mod gpgcache;
 pub mod policy;
 pub mod proto;
 pub mod redact;
+pub mod sandbox;
 pub mod secmem;
 pub mod server;
 pub mod sops;

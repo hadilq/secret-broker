@@ -5,6 +5,8 @@ let
   defaultSocket = "/run/secret-broker/broker.sock";
 in
 {
+  imports = [ ./ai-run-hm.nix ];
+
   options.programs.secret-broker = {
     enable = mkEnableOption "the secret-broker client (`secret-broker`, `secret-run`)";
 

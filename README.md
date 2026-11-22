@@ -113,7 +113,8 @@ malicious dependency) that wants to read a secret value:
    GUI pinentry too; the HM option `programs.secret-broker.gpgAgent.recommended`
    sets both. A YubiKey or smartcard with touch-to-decrypt is the strongest
    version.
-2. **Never approve a pinentry you didn't start.** If the agent runs `unlock`
+2. **Never approve a pinentry you didn't start.** (Inside `ai-run` there is no
+   gpg-agent or `~/.gnupg`, so a sandboxed agent can't even ask.) If the agent runs `unlock`
    and you approve it, the agent's descendant `gpg` holds the data key and the
    agent can ptrace it (`kernel.yama.ptrace_scope=1` allows ptracing
    descendants) to read every secret. The client marks itself non-dumpable,
@@ -211,6 +212,96 @@ secret-broker lock              # wipe now (bind it to your screen locker)
 Exit codes: the child's own, `126` refused (locked / not allowlisted /
 unknown profile), `125` broker unreachable or protocol error.
 
+## ai-run: sandbox the agent, not just the secrets
+
+secret-broker keeps *its* secrets away from an agent, but an agent running
+as you can still read everything else in `$HOME`: browser profiles, `gh`'s
+`hosts.yml`, Proton Pass data, shell history, the keyring over D-Bus.
+`ai-run` runs the agent in a [bubblewrap](https://github.com/containers/bubblewrap)
+sandbox under the same uid:
+
+| | inside `ai-run` |
+|---|---|
+| `/` | read-only, `/nix/store` and the nix daemon reachable (`nix build` works) |
+| `$HOME` | **read-only**; writable: `~/dev`, `~/Documents`, `~/Downloads`, `~/Projects`, `~/Work`, media dirs, `~/.cache`, cargo/npm caches, plus the profile's own state (e.g. `~/.grok`) |
+| credential paths | **masked** (empty tmpfs or `/dev/null`): `~/.gnupg`, `~/.ssh`, `~/.password-store`, keyrings, `gh`/`hub`/copilot, git-credentials, netrc, npm/pypi/cargo/docker/aws/gcloud/kube/rclone credentials, all browser profiles, Proton, Signal and other messengers, **other agents' logins** (`~/.config/Grok Bot`, `~/.grokbot`, `~/.grok`, `~/.claude`...), shell histories, `~/.cache/nix` (fresh, can't be poisoned) |
+| `$XDG_RUNTIME_DIR` | empty tmpfs: no session bus, gpg-agent (so no `secret-broker unlock` from inside), gnome-keyring, Hyprland IPC, `systemd --user`, docker/podman, tmux, terminal IPC sockets |
+| `/run` | system bus, `/run/docker.sock`, `/run/podman`, `/run/libvirt` masked (root-equivalent for your groups); `/run/secret-broker` **reachable**, so `secret-run` works |
+| `/tmp` | per profile, not the host's |
+| processes | own pid namespace (can't see or `/proc/<pid>/environ` your other processes), `no_new_privs` (sudo/setuid don't work) |
+| env | `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*_KEY`, `AWS_*`, `GH_*`... removed; `DISPLAY`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` removed |
+| network | allowed (agents need their API) |
+
+Why read-only `$HOME`: with a writable home, a sandboxed agent could write
+`~/.config/zsh/.zshenv`, `~/.config/hypr/*`, `~/.config/autostart/*`, a
+`systemd --user` unit, `~/.local/bin/grok` (Omarchy prefers it!) or replace an
+HM symlink, and that code would run **outside** the sandbox the next time you
+open a terminal or log in.
+
+No SSH agent by default: the socket lets the sandbox authenticate and push as
+you to every host your key opens (`sshAgent = true` per profile if you want it).
+On this machine `SSH_AUTH_SOCK` is gpg-agent's, which is also hidden.
+
+Profiles (Home Manager, `programs.ai-run.profiles.<name>`): `default`;
+`grok-build` (sees and writes `~/.grok`, `$GROK_HOME`); `grok-bot` (GUI:
+Wayland, PipeWire, `/dev/dri`; D-Bus through `xdg-dbus-proxy` with only
+notifications, the tray and the OpenURI/FileChooser/Settings portal calls,
+**not** `org.freedesktop.secrets`; its own `~/.config/Grok Bot` and
+`~/.grokbot`; an `xdg-open` that sends http(s) links to your browser via the
+portal); `grok-bot-tools` (Grok Bot's `$SHELL` points at a zsh that nests this
+stricter sandbox, so the commands the bot runs can't read the bot's own login
+or see its processes).
+
+### Forcing agents through it
+```nix
+programs.ai-run = {
+  enable = true;
+  wrap = [ pkgs.grok-build { package = grok-bot; profile = "grok-bot"; } ];
+};
+```
+`wrap` installs, at higher priority than the package, the same `bin/` names
+and `.desktop` files pointing at `ai-run`. So `grok`, Omarchy's agent
+launcher (`SUPER+SHIFT+CTRL+A` → `omarchy-agent` → agent-dispatch →
+`omarchy-agent-account-exec`, which resolves `grok` on PATH outside the
+dispatch dir) and the app menu / `grokbot://` links all start the sandbox.
+This is best effort against *your* launch paths: anything that execs the
+store path directly, or an agent that is already running unsandboxed, isn't
+affected. Restart running agents after `home-manager switch`.
+
+```sh
+ai-run --list                 # profiles
+ai-run                        # sandboxed $SHELL (default profile)
+ai-run -p grok-build -- grok  # what the grok wrapper does
+ai-run --print -p grok-bot -- grok-bot   # show the bwrap command line
+```
+
+### What it can't protect
+* **Anything not started through ai-run** is unconstrained (an agent you start
+  from an unwrapped path, a cron job, ...).
+* **Same uid from outside**: your unsandboxed processes can still ptrace or read
+  the sandbox (Yama allows descendants), so an unsandboxed agent gains nothing
+  from it.
+* **The app's own login**: Grok Bot must read `~/.config/Grok Bot`; the
+  sandboxed app process (and its built-in file tools) can. Only the shell
+  commands it runs are nested away from it. Electron's safeStorage has no
+  keyring in the sandbox, so expect to sign in to Grok Bot once; the token is
+  then stored with Electron's fixed fallback key, readable by the app only
+  because nothing else can see that directory.
+* **GUI profiles get the Wayland socket**: a Wayland client can read the
+  screen and, on Hyprland, create virtual keyboards/pointers and type into
+  your (unsandboxed) terminal. Use Hyprland's `ecosystem:enforce_permissions`
+  rules for the app if you don't need computer use. Terminal agents get no
+  Wayland socket (and no clipboard).
+* **Writable code you later run**: `~/dev` is writable, so an agent can edit
+  a repo's `flake.nix`, `.envrc`, Makefile or `.git/hooks` and that runs when
+  you use it outside. Review diffs; put repos you don't want touched in
+  `programs.ai-run.readOnly`.
+* **Network**: allowed. A sandboxed agent can exfiltrate whatever it *can*
+  read (your code) and use whatever `secret-run` allows.
+* The terminal it runs in is outside: escape sequences (e.g. OSC 52 clipboard
+  writes) still reach it. `TIOCSTI` injection is blocked by the kernel
+  (`dev.tty.legacy_tiocsti = 0`; ai-run adds `--new-session` otherwise).
+
 ## Implementation (Rust, no panics)
 
 Dependencies, kept small on purpose:
@@ -224,6 +315,10 @@ Dependencies, kept small on purpose:
 | `regex` (`std` only) | sops `encrypted_regex` / `unencrypted_regex` rules |
 | `zeroize` | wipe keys and temporary secret copies on drop |
 | `libc` | `mlock`, `madvise(MADV_DONTDUMP)`, `prctl(PR_SET_DUMPABLE, 0)`, `setrlimit(RLIMIT_CORE, 0)`, `SO_PEERCRED`, `getpwnam_r`, `killpg` |
+
+`ai-run` (`src/sandbox.rs` plans the bwrap command line and is unit tested,
+`src/bin/ai-run.rs` starts `xdg-dbus-proxy` with a sync pipe and execs bwrap)
+uses no extra crates.
 
 No async runtime, CLI parser or error crate: a thread per connection, a
 hand-written argument parser and one `Error` enum (`src/error.rs`).

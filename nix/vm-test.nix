@@ -13,6 +13,52 @@ let
       *)      exit 3 ;;
     esac
   '';
+  sb = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  aiRunConfig = pkgs.writeText "ai-run.json" (builtins.toJSON {
+    bwrap = "${pkgs.bubblewrap}/bin/bwrap";
+    dbus_proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
+    mask = [ ".gnupg" ".config/gh" ".zsh_history" ".agent-login" "/run/docker.sock" ];
+    writable = [ "dev" ];
+    env_unset = [ "DISPLAY" ];
+    env_deny = [ "*TOKEN*" ];
+    profiles = {
+      default = { };
+      agent = { unmask = [ ".agent-login" ]; writable = [ ".agent-login" ]; };
+      bus = { dbus = { talk = [ "org.example.Allowed" ]; }; };
+    };
+  });
+  aiRun = pkgs.writeShellScriptBin "ai-run" ''
+    exec ${sb}/bin/ai-run --config ${aiRunConfig} "$@"
+  '';
+  # Owns org.example.Allowed and org.freedesktop.secrets on a session bus.
+  fakeServices = pkgs.writers.writePython3 "fake-services" {
+    flakeIgnore = [ "F821" ]; # dbus-next signature annotations ("s")
+    libraries = [ pkgs.python3Packages.dbus-next ];
+  } ''
+    import asyncio
+    from dbus_next.aio import MessageBus
+    from dbus_next.service import ServiceInterface, method
+
+
+    class Svc(ServiceInterface):
+        def __init__(self):
+            super().__init__("org.example.I")
+
+        @method()
+        def Hello(self) -> "s":
+            return "hi"
+
+
+    async def main():
+        bus = await MessageBus().connect()
+        bus.export("/o", Svc())
+        await bus.request_name("org.example.Allowed")
+        await bus.request_name("org.freedesktop.secrets")
+        print("ready", flush=True)
+        await asyncio.get_event_loop().create_future()
+
+    asyncio.run(main())
+  '';
 in
 {
   name = "secret-broker";
@@ -21,7 +67,7 @@ in
     imports = [ self.nixosModules.default ];
     users.users.hadi = { isNormalUser = true; uid = 1000; };
     users.users.other = { isNormalUser = true; uid = 1001; };
-    environment.systemPackages = [ pkgs.sops pkgs.gnupg pkgs.strace pkgs.procps ];
+    environment.systemPackages = [ pkgs.sops pkgs.gnupg pkgs.strace pkgs.procps pkgs.glib.bin pkgs.dbus (lib.hiPrio aiRun) ];
     services.secret-broker = {
       enable = true;
       users = [ "hadi" ];
@@ -106,6 +152,48 @@ in
         machine.fail(h(f"exec 3< /proc/{bpid}/mem"))
         machine.succeed(h(f"timeout 5 strace -p {bpid} 2>&1 | grep -q 'Operation not permitted'"))
         machine.succeed("pkill -u agent-secrets -x sleep || true")
+
+    with subtest("ai-run: credentials masked, home read-only, broker reachable"):
+        machine.succeed(h("mkdir -p ~/.config/gh ~/dev ~/.agent-login && chmod 700 ~/.gnupg"))
+        machine.succeed(h("echo gh-token-SENTINEL > ~/.config/gh/hosts.yml && echo hist-SENTINEL > ~/.zsh_history && echo agent-SENTINEL > ~/.agent-login/auth"))
+        machine.succeed("touch /run/docker.sock")
+        # outside the sandbox, hadi can read them (that's the problem)
+        machine.succeed(h("cat ~/.config/gh/hosts.yml >/dev/null && test -n \"$(ls -A ~/.gnupg)\""))
+        out = machine.succeed(h("ai-run -- sh -c 'cat ~/.config/gh/hosts.yml ~/.zsh_history ~/.agent-login/auth 2>&1; ls -A ~/.gnupg ~/.config/gh; true'"))
+        assert "SENTINEL" not in out and "trustdb" not in out, out
+        machine.succeed(h("ai-run -- sh -c 'test -z \"$(ls -A ~/.gnupg)\"'"))
+        assert "agent-SENTINEL" in machine.succeed(h("ai-run --profile agent -- cat ~/.agent-login/auth"))
+        machine.succeed(h("ai-run -- touch ~/dev/ok"))
+        machine.fail(h("ai-run -- touch ~/.bashrc"))
+        machine.fail(h("ai-run -- touch ~/.config/x"))
+        machine.fail(h("ai-run -- sh -c 'echo x > /run/docker.sock'"))
+        assert "GH_TOKEN=leak" in machine.succeed(h("GH_TOKEN=leak env"))
+        assert "GH_TOKEN" not in machine.succeed(h("GH_TOKEN=leak ai-run -- env"))
+        bpid = machine.succeed("systemctl show -p MainPID --value secret-broker").strip()
+        machine.fail(h(f"ai-run -- test -e /proc/{bpid}"))
+        # the secret-broker socket stays usable from inside
+        out = machine.succeed(h("ai-run -- secret-run demo hash")).strip()
+        assert out == hashlib.sha256(SECRET.encode()).hexdigest(), out
+        assert "unlocked" in machine.succeed(h("ai-run -- secret-broker status"))
+        # but unlock can't be triggered from inside (no gpg-agent, no ~/.gnupg)
+        machine.fail(h("ai-run -- secret-broker unlock --ttl 1m"))
+
+    with subtest("ai-run: no session bus by default; proxy only passes allowed names"):
+        # su sessions come and go, so use a runtime dir of our own
+        machine.succeed("install -d -o hadi -m 700 /var/tmp/rt")
+        machine.succeed(h("dbus-daemon --session --address=unix:path=/var/tmp/rt/bus --fork --nopidfile"))
+        bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=/var/tmp/rt/bus XDG_RUNTIME_DIR=/var/tmp/rt"
+        machine.succeed(h(f"{bus} nohup ${fakeServices} > /tmp/fake.log 2>&1 &"))
+        machine.wait_until_succeeds("grep -q ready /tmp/fake.log")
+        ping = "gdbus call --session --dest {} --object-path /o --method org.freedesktop.DBus.Peer.Ping"
+        hello = "gdbus call --session --dest org.example.Allowed --object-path /o --method org.example.I.Hello"
+        machine.succeed(h(f"{bus} {ping.format('org.freedesktop.secrets')}"))
+        machine.succeed(h(f"{bus} {hello}"))
+        machine.fail(h(f"{bus} ai-run -- {ping.format('org.freedesktop.secrets')}"))
+        machine.fail(h(f"{bus} ai-run -- {hello}"))
+        machine.fail(h(f"{bus} ai-run -- test -S /var/tmp/rt/bus"))
+        assert "hi" in machine.succeed(h(f"{bus} ai-run --profile bus -- {hello}"))
+        machine.fail(h(f"{bus} ai-run --profile bus -- {ping.format('org.freedesktop.secrets')}"))
 
     with subtest("lock wipes"):
         machine.succeed(h("secret-broker lock"))
