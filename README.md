@@ -259,7 +259,7 @@ secret-broker fido2-enroll --name yubikey      # touch; prints a NixOS snippet:
 
 ### The dialog (`secret-broker-dialog`)
 
-A ~1.2 MB Wayland layer-shell client (smithay-client-toolkit + fontdue,
+A ~1.3 MB Wayland layer-shell client (smithay-client-toolkit + fontdue,
 software rendering into wl_shm, links only libxkbcommon and libc). It works on
 any compositor with `wlr-layer-shell` (Hyprland, sway, river, niri, KDE…):
 an overlay layer surface with **exclusive keyboard**, centred, and no pointer
@@ -298,6 +298,30 @@ bwrap's command line, which anything can fake: trust the *socket* (agent.sock
 means "came from a sandbox"), treat the rest as a description. Any secret value
 that shows up in argv is shown and logged as [REDACTED].
 
+**Keys in the PIN / passphrase field** (same in the approval dialog and in
+`pinentry-secret-broker`; all keyboard, listed under the field):
+
+| key | does |
+|---|---|
+| Enter / Esc | submit / deny (cancel) |
+| Ctrl+V, Shift+Insert | paste from the clipboard |
+| Ctrl+H | show / hide what's typed (hidden by default; the field turns yellow while shown) |
+| Ctrl+U | clear |
+| Ctrl+W, Ctrl+Backspace | delete the last word |
+
+Paste reads the regular clipboard (`wl_data_device`, `text/plain;charset=utf-8`,
+`UTF8_STRING` or `text/plain`; not the primary selection) through a pipe that
+is polled with the Wayland socket, so a clipboard owner that hangs can't
+freeze the dialog (it gives up after 2 s). At most 4 KiB is read, trailing
+newlines are dropped (`echo pw | wl-copy` works), and text with other line
+breaks or control characters is refused rather than joined. It goes straight
+into the zeroized input buffer (which never reallocates) and the dialog says
+"pasted N characters". The clipboard itself is yours to clear (password
+managers do it after a while; `wl-copy --clear`). Ctrl+H draws the text without
+the glyph cache, so the characters don't stay behind in the font cache. These
+keys only work if your compositor doesn't bind them (Hyprland/Omarchy binds
+none of them).
+
 Why not iced/GTK/Qt: on this nixpkgs, pinentry-qt's closure is ~753 MiB and
 pinentry-gnome3's ~365 MiB. iced needs wgpu/tiny-skia + winit, so it's a few
 MB of binary and still has no layer-shell or exclusive-keyboard support
@@ -306,7 +330,8 @@ without forks. The dialog has three modes:
 * `prompter` (systemd user service): registers with the broker, shows approvals.
 * `pinentry`: an Assuan pinentry, so the gpg unlock uses the same window
   (`pinentry-secret-broker`, which falls back to pinentry-curses without Wayland).
-* `demo [--window]`: renders a sample.
+* `demo [--pinentry] [--details] [--reveal] [--window]`: renders a sample (`--reveal`
+  shows a made-up value in clear).
 
 Without a running dialog, `secret-broker unlock` on a terminal asks for the PIN
 there (or the key touch). Inside ai-run the socket is restricted: no

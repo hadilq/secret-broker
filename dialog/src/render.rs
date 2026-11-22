@@ -35,6 +35,12 @@ impl Fonts {
             .or_insert_with(|| font.rasterize(c, px))
     }
 
+    /// Advance width without touching the glyph cache, for revealed secret
+    /// text (so the cache doesn't keep which characters a password uses).
+    pub fn width_uncached(&self, text: &str, px: f32) -> f32 {
+        text.chars().map(|c| self.regular.metrics(c, px).advance_width).sum()
+    }
+
     pub fn width(&mut self, bold: bool, text: &str, px: f32) -> f32 {
         text.chars().map(|c| self.glyph(bold, c, px).0.advance_width).sum()
     }
@@ -194,18 +200,36 @@ impl Canvas<'_> {
                 let g = fonts.glyph(bold, ch, px);
                 (g.0, g.1.clone())
             };
-            let gx = (pen + m.xmin as f32).round() as i32;
-            let gy = (y - m.ymin as f32 - m.height as f32).round() as i32;
-            for row in 0..m.height {
-                for col in 0..m.width {
-                    let cov = bitmap.get(row * m.width + col).copied().unwrap_or(0);
-                    if cov > 0 {
-                        self.blend(gx + col as i32, gy + row as i32, c, f32::from(cov) / 255.0);
-                    }
-                }
-            }
+            self.glyph_at(pen, y, m, &bitmap, c);
             pen += m.advance_width;
         }
         pen - x
+    }
+
+    /// Like `text` (regular face), but rasterizes each glyph on the spot and
+    /// drops it: used for a revealed passphrase, which must not end up in the
+    /// glyph cache.
+    pub fn secret_text(&mut self, fonts: &Fonts, x: f32, y: f32, px: f32, s: &str, c: Rgb) -> f32 {
+        let mut pen = x;
+        for ch in s.chars() {
+            let (m, mut bitmap) = fonts.regular.rasterize(ch, px);
+            self.glyph_at(pen, y, m, &bitmap, c);
+            zeroize::Zeroize::zeroize(&mut bitmap);
+            pen += m.advance_width;
+        }
+        pen - x
+    }
+
+    fn glyph_at(&mut self, pen: f32, y: f32, m: Metrics, bitmap: &[u8], c: Rgb) {
+        let gx = (pen + m.xmin as f32).round() as i32;
+        let gy = (y - m.ymin as f32 - m.height as f32).round() as i32;
+        for row in 0..m.height {
+            for col in 0..m.width {
+                let cov = bitmap.get(row * m.width + col).copied().unwrap_or(0);
+                if cov > 0 {
+                    self.blend(gx + col as i32, gy + row as i32, c, f32::from(cov) / 255.0);
+                }
+            }
+        }
     }
 }

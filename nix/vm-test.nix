@@ -193,7 +193,7 @@ in
     users.users.other = { isNormalUser = true; uid = 1001; };
     environment.systemPackages = [
       pkgs.sops pkgs.gnupg pkgs.strace pkgs.procps pkgs.glib.bin pkgs.dbus (lib.hiPrio aiRun)
-      dialog pkgs.sway pkgs.wtype pkgs.grim
+      dialog pkgs.sway pkgs.wtype pkgs.grim pkgs.wl-clipboard
     ];
     virtualisation.memorySize = 2048;
     services.secret-broker = {
@@ -458,7 +458,7 @@ in
         machine.succeed(h("secret-broker unlock --ttl 1h"))
         assert machine.succeed(h("secret-run demo hash")).strip() == HASH
 
-    with subtest("real dialog on headless sway: PIN typed with the keyboard"):
+    with subtest("real dialog on headless sway: keyboard only; PIN pasted from the clipboard"):
         machine.succeed(h("secret-broker lock"))
         machine.succeed("install -d -o hadi -m 700 /var/tmp/wl")
         env = "XDG_RUNTIME_DIR=/var/tmp/wl WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1"
@@ -481,7 +481,21 @@ in
         machine.succeed(h(f"{wl} grim /tmp/dialog-details.png"))
         machine.copy_from_machine("/tmp/dialog-details.png", "")
         machine.succeed(h(f"{wl} wtype -s 400 -k Down -k Down"))
-        machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 2468 -k Return"))
+        # Paste: Ctrl+U clears, the PIN comes from the clipboard (with a
+        # trailing newline, which the dialog drops), Ctrl+H reveals it.
+        machine.succeed(h(f"{wl} sh -c 'printf \"2468\\n\" | wl-copy'"))
+        machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 -M ctrl v -m ctrl"))
+        machine.sleep(1)
+        machine.succeed(h(f"{wl} grim /tmp/dialog-paste-masked.png"))
+        machine.copy_from_machine("/tmp/dialog-paste-masked.png", "")
+        machine.succeed(h(f"{wl} wtype -s 400 -M ctrl h -m ctrl"))
+        machine.sleep(1)
+        machine.succeed(h(f"{wl} grim /tmp/dialog-paste-revealed.png"))
+        machine.copy_from_machine("/tmp/dialog-paste-revealed.png", "")
+        # clear, paste again with Shift+Insert, submit
+        machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 -M shift -k Insert -m shift"))
+        machine.sleep(1)
+        machine.succeed(h(f"{wl} wtype -s 400 -k Return"))
         machine.wait_until_succeeds("test -e /tmp/real.rc")
         assert machine.succeed("cat /tmp/real.rc").strip() == "0", machine.succeed("cat /tmp/real.out /tmp/dialog-real.log")
         assert machine.succeed("cat /tmp/real.out").strip() == HASH

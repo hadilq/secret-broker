@@ -4,17 +4,29 @@
 //! There is deliberately no clickable "approve": approval is a PIN typed
 //! here (checked by the broker) or a hardware factor the broker verifies
 //! itself. The pointer isn't even bound.
+//!
+//! Keys in the secret field: Ctrl+V / Shift+Insert paste from the clipboard
+//! (wl_data_device), Ctrl+H shows/hides what was typed, Ctrl+U clears,
+//! Ctrl+W / Ctrl+Backspace delete a word.
 #![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 
 use crate::render::{Canvas, Fonts};
 use crate::theme::{Rgb, Theme};
 use smithay_client_toolkit::reexports::client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_keyboard, wl_output, wl_seat, wl_shm,
+        wl_surface,
+    },
     Connection, EventQueue, QueueHandle,
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        DataDeviceManagerState, ReadPipe,
+    },
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -38,6 +50,12 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 pub const MAX_INPUT: usize = 128;
+/// Most bytes read from the clipboard for one paste.
+pub const MAX_PASTE: usize = 4096;
+/// Give up on a clipboard owner that doesn't answer.
+const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Clipboard types we accept, best first.
+const TEXT_MIMES: [&str; 4] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -89,6 +107,12 @@ struct App {
     layer: LayerSurface,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     ctrl: bool,
+    shift: bool,
+    data_devices: Option<DataDeviceManagerState>,
+    data_device: Option<DataDevice>,
+    paste: Option<Paste>,
+    /// Show the secret field in plain text (Ctrl+H). Off by default.
+    reveal: bool,
     configured: bool,
     scale: i32,
     width: u32,
@@ -99,6 +123,56 @@ struct App {
     view: View,
     theme: Theme,
     fonts: Fonts,
+}
+
+/// A clipboard read in flight: the pipe is polled by `Ui::wait` together
+/// with the Wayland socket, so a slow clipboard owner can't freeze the dialog.
+struct Paste {
+    pipe: ReadPipe,
+    buf: Zeroizing<Vec<u8>>,
+    started: Instant,
+}
+
+/// What the secret field shows: dots, or (revealed) the text itself.
+#[derive(Clone, Copy)]
+pub struct Field<'a> {
+    pub len: usize,
+    pub plain: Option<&'a str>,
+}
+
+fn new_input() -> Zeroizing<String> {
+    // Reserve once, so typing or pasting never reallocates and leaves a
+    // stale copy of the secret behind in freed memory.
+    Zeroizing::new(String::with_capacity(MAX_INPUT * 4))
+}
+
+/// Pick the clipboard type to ask for.
+fn pick_mime(offered: &[String]) -> Option<&'static str> {
+    TEXT_MIMES.into_iter().find(|m| offered.iter().any(|o| o.eq_ignore_ascii_case(m)))
+}
+
+/// Clipboard bytes to the text to insert: UTF-8, trailing newlines dropped,
+/// no other control characters (a multi-line paste is refused, not joined).
+fn clean_paste(bytes: &[u8]) -> Result<&str, &'static str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "clipboard text is not UTF-8")?;
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.is_empty() {
+        return Err("clipboard is empty");
+    }
+    if text.chars().any(char::is_control) {
+        return Err("clipboard has line breaks or control characters");
+    }
+    Ok(text)
+}
+
+/// Ctrl+W: drop trailing spaces, then the word before them.
+fn delete_word(s: &mut String) {
+    while s.ends_with(char::is_whitespace) {
+        s.pop();
+    }
+    while s.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+        s.pop();
+    }
 }
 
 pub struct Ui {
@@ -118,6 +192,8 @@ impl Ui {
         let layer_shell = LayerShell::bind(&globals, &qh)
             .map_err(|e| format!("this compositor has no wlr-layer-shell: {e}"))?;
         let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
+        // Optional: without it there's just no paste.
+        let data_devices = DataDeviceManagerState::bind(&globals, &qh).ok();
         let surface = compositor.create_surface(&qh);
         let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("secret-broker"), None);
         // No anchor: compositors center the surface.
@@ -135,11 +211,16 @@ impl Ui {
             layer,
             keyboard: None,
             ctrl: false,
+            shift: false,
+            data_devices,
+            data_device: None,
+            paste: None,
+            reveal: false,
             configured: false,
             scale: 1,
             width: W,
             height: 300,
-            input: Zeroizing::new(String::new()),
+            input: new_input(),
             events: VecDeque::new(),
             dirty: true,
             view: View::default(),
@@ -196,17 +277,21 @@ impl Ui {
                 events: libc::POLLIN,
                 revents: 0,
             }];
-            if let Some(fd) = extra {
+            let paste_fd = self.app.paste.as_ref().map(|p| p.pipe.as_raw_fd());
+            for fd in [extra, paste_fd].into_iter().flatten() {
                 fds.push(libc::pollfd {
                     fd,
                     events: libc::POLLIN,
                     revents: 0,
                 });
             }
+            let timeout = if paste_fd.is_some() { 100 } else { 1000 };
             // SAFETY: fds is a valid array of pollfd for the duration of the call.
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+            let ready = |fd: Option<RawFd>| fd.is_some_and(|fd| fds.iter().any(|p| p.fd == fd && p.revents != 0));
             let wl_ready = fds.first().is_some_and(|p| p.revents != 0);
-            let extra_ready = fds.get(1).is_some_and(|p| p.revents != 0);
+            let extra_ready = ready(extra);
+            let paste_ready = ready(paste_fd);
             if wl_ready {
                 match guard.read() {
                     Ok(_) => {}
@@ -220,6 +305,12 @@ impl Ui {
             self.queue
                 .dispatch_pending(&mut self.app)
                 .map_err(|e| format!("wayland: {e}"))?;
+            if paste_fd.is_some() {
+                self.app.poll_paste(paste_ready);
+                if self.app.paste.is_some() && n == 0 {
+                    continue; // short paste timeout, not a 1s tick
+                }
+            }
             if let Some(ev) = self.app.events.pop_front() {
                 return Ok(ev);
             }
@@ -237,7 +328,7 @@ impl Ui {
 
     /// Render the current view into an RGBA buffer without a compositor
     /// (tests, `--render-png`).
-    pub fn render_offscreen(theme: Theme, fonts: Fonts, view: View, input_len: usize, scale: i32) -> (u32, u32, Vec<u8>) {
+    pub fn render_offscreen(theme: Theme, fonts: Fonts, view: View, field: Field<'_>, scale: i32) -> (u32, u32, Vec<u8>) {
         let mut app_like = Offscreen {
             theme,
             fonts,
@@ -252,7 +343,7 @@ impl Ui {
                 h: h as i32,
                 data: &mut data,
             };
-            paint(&mut c, &mut app_like.fonts, &app_like.theme, &app_like.view, input_len, scale as f32);
+            paint(&mut c, &mut app_like.fonts, &app_like.theme, &app_like.view, field, scale as f32);
         }
         (w, h, data)
     }
@@ -273,6 +364,7 @@ const DETAIL_PX: f32 = 12.5;
 const DETAIL_H: f32 = 18.0;
 const DETAIL_VISIBLE: usize = 16;
 const DETAIL_LABEL_W: f32 = 104.0;
+const FIELD_KEYS_H: f32 = 20.0;
 
 fn tone(t: &Theme, tone: Tone) -> Rgb {
     match tone {
@@ -328,7 +420,7 @@ fn layout_height(fonts: &mut Fonts, v: &View) -> u32 {
         h += 40.0;
     }
     if v.field.is_some() {
-        h += 12.0 + 44.0;
+        h += 12.0 + 44.0 + FIELD_KEYS_H;
     }
     h += v.hints.len() as f32 * ROW_H;
     h += 10.0 + ROW_H; // message line (reserved, so the card doesn't jump)
@@ -342,7 +434,7 @@ fn fmt_remaining(d: Option<Instant>) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, input_len: usize, s: f32) {
+fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Field<'_>, s: f32) {
     c.clear();
     let (w, h) = (c.w as f32, c.h as f32);
     // border + card
@@ -416,20 +508,50 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, input_len: 
     }
     if let Some(label) = &v.field {
         let top = y + 12.0 * s;
-        c.round_rect(x, top, inner, 44.0 * s, 9.0 * s, if v.busy { t.muted } else { t.accent });
+        let edge = if v.busy {
+            t.muted
+        } else if field.plain.is_some() {
+            t.yellow // shown in clear: make it obvious
+        } else {
+            t.accent
+        };
+        c.round_rect(x, top, inner, 44.0 * s, 9.0 * s, edge);
         c.round_rect(x + 1.5 * s, top + 1.5 * s, inner - 3.0 * s, 41.0 * s, 8.0 * s, t.surface);
         let by = top + 28.0 * s;
         let lw = c.text(fonts, false, x + 14.0 * s, by, BODY_PX * s, label, t.muted);
         let mut dx = x + 14.0 * s + lw + 10.0 * s;
-        let n = input_len.min(24);
-        for _ in 0..n {
-            c.round_rect(dx, by - 9.0 * s, 9.0 * s, 9.0 * s, 4.5 * s, t.foreground);
-            dx += 15.0 * s;
+        let room = x + inner - 18.0 * s - dx;
+        if let Some(plain) = field.plain {
+            // Show the end of the text if it doesn't fit (that's where the
+            // cursor is).
+            let px = BODY_PX * s;
+            let mut start = 0;
+            while fonts.width_uncached(plain.get(start..).unwrap_or(""), px) > room {
+                match plain.get(start..).and_then(|r| r.chars().next()) {
+                    Some(ch) => start += ch.len_utf8(),
+                    None => break,
+                }
+            }
+            let shown = plain.get(start..).unwrap_or("");
+            dx += c.secret_text(fonts, dx, by, px, shown, t.foreground) + 2.0 * s;
+        } else {
+            let n = field.len.min((room / (15.0 * s)).max(0.0) as usize);
+            for _ in 0..n {
+                c.round_rect(dx, by - 9.0 * s, 9.0 * s, 9.0 * s, 4.5 * s, t.foreground);
+                dx += 15.0 * s;
+            }
         }
         if !v.busy {
             c.round_rect(dx, by - 15.0 * s, 2.0 * s, 19.0 * s, 1.0 * s, t.accent);
         }
         y = top + 44.0 * s;
+        let keys = format!(
+            "Ctrl+V paste    Ctrl+H {}    Ctrl+U clear    Ctrl+W delete word",
+            if field.plain.is_some() { "hide" } else { "show" }
+        );
+        let kl = fonts.ellipsize(false, &keys, SMALL_PX * s, inner);
+        c.text(fonts, false, x + 4.0 * s, y + (FIELD_KEYS_H - 3.0) * s, SMALL_PX * s, &kl, t.muted);
+        y += FIELD_KEYS_H * s;
     }
     for hint in &v.hints {
         y += ROW_H * s;
@@ -466,8 +588,11 @@ impl App {
         };
         {
             let mut c = Canvas { w: pw, h: ph, data };
-            let n = self.input.chars().count();
-            paint(&mut c, &mut self.fonts, &self.theme, &self.view, n, s as f32);
+            let field = Field {
+                len: self.input.chars().count(),
+                plain: self.reveal.then_some(self.input.as_str()),
+            };
+            paint(&mut c, &mut self.fonts, &self.theme, &self.view, field, s as f32);
         }
         let surf = self.layer.wl_surface();
         surf.set_buffer_scale(s);
@@ -486,6 +611,105 @@ impl App {
         } else {
             cur.saturating_add(delta.unsigned_abs()).min(max)
         };
+        self.dirty = true;
+    }
+
+    /// Ctrl+V: ask the clipboard owner for text; `Ui::wait` reads the pipe.
+    fn start_paste(&mut self) {
+        if self.view.field.is_none() || self.view.busy || self.paste.is_some() {
+            return;
+        }
+        let offer = self.data_device.as_ref().and_then(|d| d.data().selection_offer());
+        let Some(offer) = offer else {
+            self.note("clipboard is empty", Tone::Warn);
+            return;
+        };
+        let Some(mime) = offer.with_mime_types(pick_mime) else {
+            self.note("clipboard has no text", Tone::Warn);
+            return;
+        };
+        let pipe = match offer.receive(mime.to_string()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.note(&format!("paste failed: {e}"), Tone::Error);
+                return;
+            }
+        };
+        let fd = pipe.as_raw_fd();
+        // SAFETY: fcntl on a pipe fd we own; failure only means blocking reads,
+        // and we only read after poll says readable.
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            if fl >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+        self.paste = Some(Paste {
+            pipe,
+            buf: Zeroizing::new(Vec::with_capacity(MAX_PASTE + 1024)),
+            started: Instant::now(),
+        });
+    }
+
+    /// Read what's there; finish on EOF, too much data, or timeout.
+    fn poll_paste(&mut self, readable: bool) {
+        use std::io::Read;
+        let Some(p) = self.paste.as_mut() else { return };
+        let mut done = false;
+        let mut err = None;
+        if readable {
+            let mut chunk = Zeroizing::new([0u8; 1024]);
+            loop {
+                match p.pipe.read(&mut chunk[..]) {
+                    Ok(0) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        if p.buf.len() + n > MAX_PASTE {
+                            err = Some("clipboard text is too long (over 4 KiB)");
+                            break;
+                        }
+                        p.buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        err = Some("couldn't read the clipboard");
+                        break;
+                    }
+                }
+            }
+        }
+        if err.is_none() && !done && p.started.elapsed() > PASTE_TIMEOUT {
+            err = Some("the clipboard owner didn't answer");
+        }
+        if err.is_none() && !done {
+            return;
+        }
+        let Some(p) = self.paste.take() else { return };
+        if let Some(e) = err {
+            self.note(e, Tone::Error);
+            return;
+        }
+        let text = match clean_paste(&p.buf) {
+            Ok(t) => t,
+            Err(e) => {
+                self.note(e, Tone::Warn);
+                return;
+            }
+        };
+        let n = text.chars().count();
+        if self.input.chars().count() + n > MAX_INPUT {
+            self.note(&format!("too long to paste (max {MAX_INPUT} characters)"), Tone::Error);
+            return;
+        }
+        self.input.push_str(text);
+        self.note(&format!("pasted {n} characters"), Tone::Muted);
+    }
+
+    fn note(&mut self, m: &str, tone: Tone) {
+        self.view.message = Some((m.to_string(), tone));
         self.dirty = true;
     }
 
@@ -511,7 +735,8 @@ impl App {
                     if self.input.is_empty() {
                         return;
                     }
-                    let pin = std::mem::replace(&mut self.input, Zeroizing::new(String::new()));
+                    let pin = std::mem::replace(&mut self.input, new_input());
+                    self.paste = None;
                     self.events.push_back(UiEvent::Submit(pin));
                 } else {
                     self.events.push_back(UiEvent::Submit(Zeroizing::new(String::new())));
@@ -519,18 +744,27 @@ impl App {
                 self.dirty = true;
             }
             Keysym::BackSpace => {
-                self.input.pop();
+                if self.ctrl {
+                    delete_word(&mut self.input);
+                } else {
+                    self.input.pop();
+                }
                 self.dirty = true;
             }
+            Keysym::Insert if self.shift && !self.ctrl => self.start_paste(),
             _ => {
                 if self.view.field.is_none() || self.view.busy {
                     return;
                 }
                 if self.ctrl {
-                    if matches!(ev.keysym, Keysym::u | Keysym::U) {
-                        self.input = Zeroizing::new(String::new());
-                        self.dirty = true;
+                    match ev.keysym {
+                        Keysym::u | Keysym::U => zeroize::Zeroize::zeroize(&mut *self.input),
+                        Keysym::w | Keysym::W => delete_word(&mut self.input),
+                        Keysym::h | Keysym::H => self.reveal = !self.reveal,
+                        Keysym::v | Keysym::V => self.start_paste(),
+                        _ => return,
                     }
+                    self.dirty = true;
                     return;
                 }
                 if let Some(t) = ev.utf8.as_deref() {
@@ -593,6 +827,9 @@ impl SeatHandler for App {
         if cap == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
         }
+        if cap == Capability::Keyboard && self.data_device.is_none() {
+            self.data_device = self.data_devices.as_ref().map(|m| m.get_data_device(qh, &seat));
+        }
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
         if cap == Capability::Keyboard {
@@ -618,7 +855,22 @@ impl KeyboardHandler for App {
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
     fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, m: Modifiers, _: RawModifiers, _: u32) {
         self.ctrl = m.ctrl;
+        self.shift = m.shift;
     }
+}
+
+// Only the clipboard selection is used; drag and drop is ignored.
+impl DataDeviceHandler for App {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataOfferHandler for App {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
 }
 
 impl ShmHandler for App {
@@ -636,3 +888,42 @@ impl ProvidesRegistryState for App {
 
 delegate_registry!(App);
 smithay_client_toolkit::delegate_dispatch2!(App);
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_cleaning() {
+        assert_eq!(clean_paste(b"hunter2\n"), Ok("hunter2"));
+        assert_eq!(clean_paste(b"hunter2\r\n"), Ok("hunter2"));
+        assert_eq!(clean_paste("pässwörd ✓".as_bytes()), Ok("pässwörd ✓"));
+        assert_eq!(clean_paste(b"a b"), Ok("a b"));
+        assert!(clean_paste(b"").is_err());
+        assert!(clean_paste(b"\n").is_err());
+        assert!(clean_paste(b"two\nlines").is_err());
+        assert!(clean_paste(b"tab\there").is_err());
+        assert!(clean_paste(&[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn mime_choice() {
+        let m = |v: &[&str]| pick_mime(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(m(&["text/plain", "text/plain;charset=utf-8"]), Some("text/plain;charset=utf-8"));
+        assert_eq!(m(&["TEXT", "text/plain"]), Some("text/plain"));
+        assert_eq!(m(&["UTF8_STRING"]), Some("UTF8_STRING"));
+        assert_eq!(m(&["image/png"]), None);
+    }
+
+    #[test]
+    fn word_delete() {
+        let mut s = String::from("correct horse  ");
+        delete_word(&mut s);
+        assert_eq!(s, "correct ");
+        delete_word(&mut s);
+        assert_eq!(s, "");
+        delete_word(&mut s);
+        assert_eq!(s, "");
+    }
+}

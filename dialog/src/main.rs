@@ -20,7 +20,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   secret-broker-dialog [prompter] [--font FILE] [--font-bold FILE] [--theme colors.toml]
   secret-broker-dialog pinentry [--fallback /path/to/pinentry-curses] [--font FILE] ...
-  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--window]
+  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--reveal] [--window]
 ";
 
 #[derive(Debug, Default)]
@@ -144,6 +144,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let mut window = false;
     let mut pin_mode = false;
     let mut details = false;
+    let mut reveal = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -152,6 +153,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
             "--window" => window = true,
             "--pinentry" => pin_mode = true,
             "--details" => details = true,
+            "--reveal" => reveal = true,
             _ => {}
         }
     }
@@ -188,7 +190,13 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let (w, h, rgba) = ui::Ui::render_offscreen(theme, fonts, view, 6, scale);
+    // A made-up value, only for the screenshot of the revealed field.
+    let sample = if pin_mode { "correct horse battery" } else { "424242" };
+    let field = ui::Field {
+        len: sample.chars().count(),
+        plain: reveal.then_some(sample),
+    };
+    let (w, h, rgba) = ui::Ui::render_offscreen(theme, fonts, view, field, scale);
     // PPM over the theme's dark background (alpha composited).
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     for px in rgba.chunks_exact(4) {
