@@ -9,6 +9,7 @@ let
     [ "--font" "${dcfg.font}" ]
     ++ lib.optionals (dcfg.fontBold != null) [ "--font-bold" "${dcfg.fontBold}" ]
     ++ lib.optionals (dcfg.theme != null) [ "--theme" "${dcfg.theme}" ]
+    ++ [ "--size" (toString dcfg.size) ]
   );
 
   # gpg-agent's pinentry: the same dialog; pinentry-curses when there is no
@@ -107,6 +108,16 @@ in
         type = types.nullOr types.path;
         default = null;
         description = "colors.toml to use; null follows the current Omarchy theme.";
+      };
+      size = mkOption {
+        type = types.numbers.between 0.5 2.0;
+        default = 0.75;
+        example = 1.0;
+        description = ''
+          Size of the dialog (fonts and box together), relative to the
+          original layout. 0.75 is the default; 1.0 is the larger, older look.
+          Also settable per run with `--size` or SECRET_BROKER_DIALOG_SIZE.
+        '';
       };
     };
   };

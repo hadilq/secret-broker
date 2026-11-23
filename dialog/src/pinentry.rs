@@ -86,7 +86,7 @@ fn ask(opts: &Opts, v: View) -> Result<Option<Zeroizing<String>>, String> {
     let fonts = crate::load_fonts(opts)?;
     let theme = crate::theme::load(opts.theme.as_deref());
     let deadline = v.deadline;
-    let mut ui = Ui::open(theme, fonts)?;
+    let mut ui = Ui::open(theme, fonts, opts.size())?;
     ui.set_view(v);
     loop {
         if deadline.is_some_and(|d| Instant::now() >= d) {

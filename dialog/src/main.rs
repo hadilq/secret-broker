@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  secret-broker-dialog [prompter] [--font FILE] [--font-bold FILE] [--theme colors.toml]
+  secret-broker-dialog [prompter] [--font FILE] [--font-bold FILE] [--theme colors.toml] [--size 0.75]
   secret-broker-dialog pinentry [--fallback /path/to/pinentry-curses] [--font FILE] ...
-  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--reveal] [--window]
+  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--reveal] [--unfocused] [--window]
 ";
 
 #[derive(Debug, Default)]
@@ -29,6 +29,15 @@ pub struct Opts {
     pub font_bold: Option<PathBuf>,
     pub theme: Option<PathBuf>,
     pub fallback: Option<String>,
+    /// `--size` (or SECRET_BROKER_DIALOG_SIZE): scales fonts and the box.
+    pub size: Option<f32>,
+}
+
+impl Opts {
+    pub fn size(&self) -> f32 {
+        let env = || std::env::var("SECRET_BROKER_DIALOG_SIZE").ok().and_then(|v| v.trim().parse().ok());
+        ui::clamp_size(self.size.or_else(env).unwrap_or(ui::DEFAULT_SIZE))
+    }
 }
 
 fn fc_match(pattern: &str) -> Option<PathBuf> {
@@ -145,6 +154,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let mut pin_mode = false;
     let mut details = false;
     let mut reveal = false;
+    let mut unfocused = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -154,6 +164,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
             "--pinentry" => pin_mode = true,
             "--details" => details = true,
             "--reveal" => reveal = true,
+            "--unfocused" => unfocused = true,
             _ => {}
         }
     }
@@ -174,7 +185,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let fonts = load_fonts(o)?;
     let theme = theme::load(o.theme.as_deref());
     if window {
-        let mut u = ui::Ui::open(theme, fonts)?;
+        let mut u = ui::Ui::open(theme, fonts, o.size())?;
         u.set_view(view);
         loop {
             match u.wait(None)? {
@@ -195,8 +206,9 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let field = ui::Field {
         len: sample.chars().count(),
         plain: reveal.then_some(sample),
+        focused: !unfocused,
     };
-    let (w, h, rgba) = ui::Ui::render_offscreen(theme, fonts, view, field, scale);
+    let (w, h, rgba) = ui::Ui::render_offscreen(theme, fonts, view, field, scale, o.size());
     // PPM over the theme's dark background (alpha composited).
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     for px in rgba.chunks_exact(4) {
@@ -235,6 +247,7 @@ fn main() -> ExitCode {
             "--font-bold" => o.font_bold = it.next().map(PathBuf::from),
             "--theme" => o.theme = it.next().map(PathBuf::from),
             "--fallback" => o.fallback = it.next().cloned(),
+            "--size" => o.size = it.next().and_then(|v| v.parse().ok()),
             other => passthrough.push(other.to_string()),
         }
     }

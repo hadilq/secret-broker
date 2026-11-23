@@ -193,7 +193,7 @@ in
     users.users.other = { isNormalUser = true; uid = 1001; };
     environment.systemPackages = [
       pkgs.sops pkgs.gnupg pkgs.strace pkgs.procps pkgs.glib.bin pkgs.dbus (lib.hiPrio aiRun)
-      dialog pkgs.sway pkgs.wtype pkgs.grim pkgs.wl-clipboard
+      dialog pkgs.sway pkgs.wtype pkgs.grim pkgs.wl-clipboard pkgs.wev pkgs.wlrctl pkgs.jq
     ];
     virtualisation.memorySize = 2048;
     services.secret-broker = {
@@ -208,7 +208,8 @@ in
         deny = [ [ "env" ] ];
       };
       approval = {
-        timeout = 30;
+        # long enough for the sway subtest's focus steps; nothing waits for it
+        timeout = 120;
         pin.minLength = 4;
         pin.maxAttempts = 4;
         fido2 = {
@@ -291,7 +292,7 @@ in
 
     with subtest("caller cannot read the child's or the broker's memory/environment"):
         machine.succeed(h("nohup secret-run demo sleep >/dev/null 2>&1 &"))
-        machine.wait_until_succeeds("pgrep -u agent-secrets -x sleep")
+        machine.wait_until_succeeds("pgrep -u agent-secrets -x sleep", timeout=60)
         pid = machine.succeed("pgrep -u agent-secrets -x sleep | head -1").strip()
         # sanity: the secret really is in the child's environment (root can see it)
         machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ | grep -q '^DEMO_TOKEN='")
@@ -347,7 +348,7 @@ in
         machine.succeed(h("dbus-daemon --session --address=unix:path=/var/tmp/rt/bus --fork --nopidfile"))
         bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=/var/tmp/rt/bus XDG_RUNTIME_DIR=/var/tmp/rt"
         machine.succeed(h(f"{bus} nohup ${fakeServices} > /tmp/fake.log 2>&1 &"))
-        machine.wait_until_succeeds("grep -q ready /tmp/fake.log")
+        machine.wait_until_succeeds("grep -q ready /tmp/fake.log", timeout=60)
         ping = "gdbus call --session --dest {} --object-path /o --method org.freedesktop.DBus.Peer.Ping"
         hello = "gdbus call --session --dest org.example.Allowed --object-path /o --method org.example.I.Hello"
         machine.succeed(h(f"{bus} {ping.format('org.freedesktop.secrets')}"))
@@ -378,7 +379,7 @@ in
     def dialog(mode, arg="", log="/tmp/dialog.log"):
         machine.succeed(f"rm -f {log}")
         machine.succeed(h(f"nohup ${fakeDialog} {log} {mode} {arg} > /dev/null 2>&1 &"))
-        machine.wait_until_succeeds(f"grep -q register {log}")
+        machine.wait_until_succeeds(f"grep -q register {log}", timeout=60)
 
     def requests(log="/tmp/dialog.log"):
         import json as _j
@@ -422,11 +423,11 @@ in
         machine.succeed("rm -rf /run/fido2-mock && install -d -m 755 /run/fido2-mock")
         dialog("wait")
         machine.succeed(h("(ai-run -- secret-run demo hash > /tmp/fido.out 2>&1; echo $? > /tmp/fido.rc) > /dev/null 2>&1 < /dev/null &"))
-        machine.wait_until_succeeds("grep -q request /tmp/dialog.log")
+        machine.wait_until_succeeds("grep -q request /tmp/dialog.log", timeout=60)
         machine.sleep(1)
         assert "sealed" in machine.succeed(h("secret-broker status"))
         machine.succeed("install -m 644 /dev/null /run/fido2-mock/touch")
-        machine.wait_until_succeeds("test -e /tmp/fido.rc")
+        machine.wait_until_succeeds("test -e /tmp/fido.rc", timeout=60)
         assert machine.succeed("cat /tmp/fido.rc").strip() == "0", machine.succeed("cat /tmp/fido.out; journalctl -u secret-broker --no-pager | tail -30; cat /tmp/dialog.log; ls -la /run/fido2-mock; systemctl show secret-broker -p DevicePolicy -p PrivateDevices")
         assert any("fido2" in m.get("message", "") for m in requests() if m.get("kind") == "done")
         machine.succeed("rm /run/fido2-mock/touch")
@@ -458,33 +459,64 @@ in
         machine.succeed(h("secret-broker unlock --ttl 1h"))
         assert machine.succeed(h("secret-run demo hash")).strip() == HASH
 
-    with subtest("real dialog on headless sway: keyboard only; PIN pasted from the clipboard"):
+    with subtest("real dialog on headless sway: keyboard only; focus can leave and come back; PIN pasted"):
         machine.succeed(h("secret-broker lock"))
         machine.succeed("install -d -o hadi -m 700 /var/tmp/wl")
         env = "XDG_RUNTIME_DIR=/var/tmp/wl WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1"
         machine.succeed(h(f"{env} nohup sway -c ${swayConfig} > /tmp/sway.log 2>&1 &"))
-        machine.wait_until_succeeds("ls /var/tmp/wl/wayland-1")
+        machine.wait_until_succeeds("ls /var/tmp/wl/wayland-1", timeout=60)
         wl = "XDG_RUNTIME_DIR=/var/tmp/wl WAYLAND_DISPLAY=wayland-1"
         machine.succeed(h(f"{wl} nohup secret-broker-dialog prompter --font ${font} --font-bold ${fontBold} > /tmp/dialog-real.log 2>&1 &"))
-        machine.wait_until_succeeds("grep -q connected /tmp/dialog-real.log")
+        machine.wait_until_succeeds("grep -q connected /tmp/dialog-real.log", timeout=60)
         machine.succeed(h("(ai-run -- secret-run demo hash > /tmp/real.out 2>&1; echo $? > /tmp/real.rc) > /dev/null 2>&1 < /dev/null &"))
         machine.sleep(2)
         machine.succeed(h(f"{wl} grim /tmp/dialog.png"))
         machine.copy_from_machine("/tmp/dialog.png", "")
         # (the first keys after wtype creates its virtual keyboard can race the
         # keyboard capability; Ctrl+U clears whatever arrived)
+        wrong = int(machine.succeed("grep -c '\"event\":\"pin_wrong\"' /var/log/secret-broker/audit.jsonl || true").strip() or 0)
         machine.succeed(h(f"{wl} wtype -s 300 9999 -k Return"))
         machine.sleep(1)
+        # the dialog had keyboard focus as soon as it appeared (on-demand
+        # focus, not exclusive): the wrong PIN reached the broker
+        machine.wait_until_succeeds(f"test $(grep -c '\"event\":\"pin_wrong\"' /var/log/secret-broker/audit.jsonl) -gt {wrong}", timeout=60)
         # Tab: full details of the requester and the session owner
         machine.succeed(h(f"{wl} wtype -s 400 -k Tab"))
         machine.sleep(1)
         machine.succeed(h(f"{wl} grim /tmp/dialog-details.png"))
         machine.copy_from_machine("/tmp/dialog-details.png", "")
         machine.succeed(h(f"{wl} wtype -s 400 -k Down -k Down"))
+        # Another window can take the keyboard while the dialog is open
+        # (to look up a password), and typing goes there, not to the dialog.
+        # (stdbuf: wev's stdout to a file is block-buffered otherwise)
+        machine.succeed(h(f"{wl} nohup stdbuf -oL wev > /tmp/wev.log 2>&1 &"))
+        machine.wait_until_succeeds("grep -q 'configure' /tmp/wev.log", timeout=30)
+        # it maps under the dialog, which keeps the keyboard (sway doesn't
+        # move focus off an on-demand overlay by itself): click wev where the
+        # centred dialog doesn't cover it (top-left corner of the output)
+        machine.succeed(h(f"{wl} wlrctl pointer move -3000 -3000"))
+        machine.succeed(h(f"{wl} wlrctl pointer move 40 40"))
+        machine.succeed(h(f"{wl} wlrctl pointer click left"))
+        # (the headless seat has a keyboard only while wtype runs, so wev
+        # can't log a keyboard enter yet; ask sway who has focus)
+        ipc = "SWAYSOCK=$(ls /var/tmp/wl/sway-ipc.*) swaymsg -t get_tree"
+        machine.wait_until_succeeds(h(f"{wl} {ipc}") + " | jq -e '[.. | objects | select(.app_id? == \"wev\") | .focused] | any'", timeout=30)
+        machine.succeed(h(f"{wl} wtype -s 300 xyz"))
+        machine.wait_until_succeeds("grep -q 'sym: z' /tmp/wev.log", timeout=60)
+        machine.sleep(1)
+        machine.succeed(h(f"{wl} grim /tmp/dialog-unfocused.png"))
+        machine.copy_from_machine("/tmp/dialog-unfocused.png", "")
+        machine.fail("test -e /tmp/real.rc")  # losing focus didn't deny or submit
+        # Click the dialog (centred on the 1280x800 output) to type there again.
+        machine.succeed(h(f"{wl} wlrctl pointer move 600 360"))
+        machine.succeed(h(f"{wl} wlrctl pointer click left"))
+        machine.sleep(1)
         # Paste: Ctrl+U clears, the PIN comes from the clipboard (with a
         # trailing newline, which the dialog drops), Ctrl+H reveals it.
         machine.succeed(h(f"{wl} sh -c 'printf \"2468\\n\" | wl-copy'"))
         machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 -M ctrl v -m ctrl"))
+        # the keys went to the dialog again, not to wev
+        machine.fail("grep -q 'sym: v' /tmp/wev.log")
         machine.sleep(1)
         machine.succeed(h(f"{wl} grim /tmp/dialog-paste-masked.png"))
         machine.copy_from_machine("/tmp/dialog-paste-masked.png", "")
@@ -496,9 +528,10 @@ in
         machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 -M shift -k Insert -m shift"))
         machine.sleep(1)
         machine.succeed(h(f"{wl} wtype -s 400 -k Return"))
-        machine.wait_until_succeeds("test -e /tmp/real.rc")
+        machine.wait_until_succeeds("test -e /tmp/real.rc", timeout=60)
         assert machine.succeed("cat /tmp/real.rc").strip() == "0", machine.succeed("cat /tmp/real.out /tmp/dialog-real.log")
         assert machine.succeed("cat /tmp/real.out").strip() == HASH
+        machine.succeed("pkill -x wev")
 
     with subtest("audit log: every event with its caller; hadi reads it, can't change it; sandboxes can't see it"):
         machine.fail(h(f"secret-run demo {SECRET}"))  # refused, argv logged redacted

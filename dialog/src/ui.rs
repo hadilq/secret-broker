@@ -1,5 +1,10 @@
-//! The dialog window: one wlr-layer-shell surface on the Overlay layer with
-//! exclusive keyboard focus, drawn in software into wl_shm. No toolkit.
+//! The dialog window: one wlr-layer-shell surface on the Overlay layer,
+//! drawn in software into wl_shm. No toolkit.
+//!
+//! Keyboard focus is *on demand*: the compositor focuses the dialog when it
+//! appears, but you can click another window (to look up a password, say)
+//! and click the dialog again to come back. Losing focus never submits or
+//! denies anything; the dialog just shows that typing goes elsewhere.
 //!
 //! There is deliberately no clickable "approve": approval is a PIN typed
 //! here (checked by the broker) or a hardware factor the broker verifies
@@ -50,6 +55,8 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 pub const MAX_INPUT: usize = 128;
+/// Default size relative to the original layout (fonts and box).
+pub const DEFAULT_SIZE: f32 = 0.75;
 /// Most bytes read from the clipboard for one paste.
 pub const MAX_PASTE: usize = 4096;
 /// Give up on a clipboard owner that doesn't answer.
@@ -108,6 +115,10 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     ctrl: bool,
     shift: bool,
+    /// Keyboard focus is ours (wl_keyboard enter/leave).
+    focused: bool,
+    /// Size factor for the whole layout (`--size`).
+    zoom: f32,
     data_devices: Option<DataDeviceManagerState>,
     data_device: Option<DataDevice>,
     paste: Option<Paste>,
@@ -138,6 +149,22 @@ struct Paste {
 pub struct Field<'a> {
     pub len: usize,
     pub plain: Option<&'a str>,
+    /// false: keyboard focus is in another window.
+    pub focused: bool,
+}
+
+/// Logical (surface) pixels for a layout length at this size.
+fn zoomed(v: f32, zoom: f32) -> u32 {
+    (v * zoom).ceil().max(1.0) as u32
+}
+
+/// Clamp a `--size` value; anything unusable means the default.
+pub fn clamp_size(z: f32) -> f32 {
+    if z.is_finite() && z > 0.0 {
+        z.clamp(0.5, 2.0)
+    } else {
+        DEFAULT_SIZE
+    }
 }
 
 fn new_input() -> Zeroizing<String> {
@@ -184,7 +211,9 @@ pub struct Ui {
 const W: u32 = 560;
 
 impl Ui {
-    pub fn open(theme: Theme, fonts: Fonts) -> Result<Ui, String> {
+    pub fn open(theme: Theme, fonts: Fonts, size: f32) -> Result<Ui, String> {
+        let zoom = clamp_size(size);
+        let (w0, h0) = (zoomed(W as f32, zoom), zoomed(300.0, zoom));
         let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
         let (globals, queue) = registry_queue_init::<App>(&conn).map_err(|e| format!("wayland: {e}"))?;
         let qh = queue.handle();
@@ -197,11 +226,13 @@ impl Ui {
         let surface = compositor.create_surface(&qh);
         let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("secret-broker"), None);
         // No anchor: compositors center the surface.
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        // OnDemand, not Exclusive: other windows stay usable (compositors
+        // focus an Overlay on-demand surface when it maps, and on click).
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         layer.set_exclusive_zone(-1);
-        layer.set_size(W, 300);
+        layer.set_size(w0, h0);
         layer.commit();
-        let pool = SlotPool::new((W * 300 * 4) as usize, &shm).map_err(|e| format!("shm pool: {e}"))?;
+        let pool = SlotPool::new((w0 * h0 * 4) as usize, &shm).map_err(|e| format!("shm pool: {e}"))?;
         let app = App {
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
@@ -212,14 +243,16 @@ impl Ui {
             keyboard: None,
             ctrl: false,
             shift: false,
+            focused: false,
+            zoom,
             data_devices,
             data_device: None,
             paste: None,
             reveal: false,
             configured: false,
             scale: 1,
-            width: W,
-            height: 300,
+            width: w0,
+            height: h0,
             input: new_input(),
             events: VecDeque::new(),
             dirty: true,
@@ -328,14 +361,15 @@ impl Ui {
 
     /// Render the current view into an RGBA buffer without a compositor
     /// (tests, `--render-png`).
-    pub fn render_offscreen(theme: Theme, fonts: Fonts, view: View, field: Field<'_>, scale: i32) -> (u32, u32, Vec<u8>) {
+    pub fn render_offscreen(theme: Theme, fonts: Fonts, view: View, field: Field<'_>, scale: i32, size: f32) -> (u32, u32, Vec<u8>) {
+        let zoom = clamp_size(size);
         let mut app_like = Offscreen {
             theme,
             fonts,
             view,
         };
         let h = layout_height(&mut app_like.fonts, &app_like.view);
-        let (w, h) = (W * scale as u32, h * scale as u32);
+        let (w, h) = (zoomed(W as f32, zoom) * scale as u32, zoomed(h, zoom) * scale as u32);
         let mut data = vec![0u8; (w * h * 4) as usize];
         {
             let mut c = Canvas {
@@ -343,7 +377,7 @@ impl Ui {
                 h: h as i32,
                 data: &mut data,
             };
-            paint(&mut c, &mut app_like.fonts, &app_like.theme, &app_like.view, field, scale as f32);
+            paint(&mut c, &mut app_like.fonts, &app_like.theme, &app_like.view, field, scale as f32 * zoom);
         }
         (w, h, data)
     }
@@ -408,7 +442,7 @@ fn details_height(fonts: &mut Fonts, v: &View) -> f32 {
 }
 
 /// Logical height for a view.
-fn layout_height(fonts: &mut Fonts, v: &View) -> u32 {
+fn layout_height(fonts: &mut Fonts, v: &View) -> f32 {
     let mut h = PAD + TITLE_PX + 14.0;
     h += v.rows.len() as f32 * ROW_H;
     h += details_height(fonts, v);
@@ -425,7 +459,7 @@ fn layout_height(fonts: &mut Fonts, v: &View) -> u32 {
     h += v.hints.len() as f32 * ROW_H;
     h += 10.0 + ROW_H; // message line (reserved, so the card doesn't jump)
     h += 14.0 + SMALL_PX + PAD;
-    h.ceil() as u32
+    h
 }
 
 fn fmt_remaining(d: Option<Instant>) -> String {
@@ -508,7 +542,7 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
     }
     if let Some(label) = &v.field {
         let top = y + 12.0 * s;
-        let edge = if v.busy {
+        let edge = if v.busy || !field.focused {
             t.muted
         } else if field.plain.is_some() {
             t.yellow // shown in clear: make it obvious
@@ -541,7 +575,7 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
                 dx += 15.0 * s;
             }
         }
-        if !v.busy {
+        if !v.busy && field.focused {
             c.round_rect(dx, by - 15.0 * s, 2.0 * s, 19.0 * s, 1.0 * s, t.accent);
         }
         y = top + 44.0 * s;
@@ -549,8 +583,13 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
             "Ctrl+V paste    Ctrl+H {}    Ctrl+U clear    Ctrl+W delete word",
             if field.plain.is_some() { "hide" } else { "show" }
         );
+        let (keys, kc) = if field.focused {
+            (keys, t.muted)
+        } else {
+            ("Typing goes to another window. Click here to type.".to_string(), t.yellow)
+        };
         let kl = fonts.ellipsize(false, &keys, SMALL_PX * s, inner);
-        c.text(fonts, false, x + 4.0 * s, y + (FIELD_KEYS_H - 3.0) * s, SMALL_PX * s, &kl, t.muted);
+        c.text(fonts, false, x + 4.0 * s, y + (FIELD_KEYS_H - 3.0) * s, SMALL_PX * s, &kl, kc);
         y += FIELD_KEYS_H * s;
     }
     for hint in &v.hints {
@@ -572,10 +611,10 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
 impl App {
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
         self.dirty = false;
-        let want_h = layout_height(&mut self.fonts, &self.view);
+        let want_h = zoomed(layout_height(&mut self.fonts, &self.view), self.zoom);
         if want_h != self.height {
             self.height = want_h;
-            self.layer.set_size(W, want_h);
+            self.layer.set_size(zoomed(W as f32, self.zoom), want_h);
             self.layer.commit();
             // wait for the configure with the new size
             return;
@@ -591,8 +630,9 @@ impl App {
             let field = Field {
                 len: self.input.chars().count(),
                 plain: self.reveal.then_some(self.input.as_str()),
+                focused: self.focused,
             };
-            paint(&mut c, &mut self.fonts, &self.theme, &self.view, field, s as f32);
+            paint(&mut c, &mut self.fonts, &self.theme, &self.view, field, s as f32 * self.zoom);
         }
         let surf = self.layer.wl_surface();
         surf.set_buffer_scale(s);
@@ -842,8 +882,21 @@ impl SeatHandler for App {
 }
 
 impl KeyboardHandler for App {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+        self.focused = true;
+        // modifiers come in a separate event right after enter
+        self.ctrl = false;
+        self.shift = false;
+        self.dirty = true;
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
+        // Focus went to another window: forget held modifiers (we won't see
+        // them released). Never submit or deny because of this.
+        self.focused = false;
+        self.ctrl = false;
+        self.shift = false;
+        self.dirty = true;
+    }
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
         self.key(ev);
     }

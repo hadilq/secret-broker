@@ -298,7 +298,10 @@ in
         description = lib.mkDefault "Grok Bot desktop app: GUI, filtered D-Bus, its own login";
         unmask = [ ".config/Grok Bot" ".grokbot" ];
         # .local/share/pki: Chromium's NSS certificate DB.
-        writable = [ ".config/Grok Bot" ".grokbot" ".local/share/pki" ];
+        # terminals: the app's shell tool writes each command's output to
+        # ~/terminals/<id>.txt (EROFS = commands fail to start). Command
+        # output only; the nested grok-bot-tools sandbox sees it read-only.
+        writable = [ ".config/Grok Bot" ".grokbot" ".local/share/pki" "terminals" ];
         gui = lib.mkDefault true;
         dbus = lib.mkDefault {
           talk = [ "org.freedesktop.Notifications" "org.kde.StatusNotifierWatcher" ];

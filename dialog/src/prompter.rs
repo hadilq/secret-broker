@@ -239,7 +239,7 @@ fn handle(opts: &Opts, s: &mut UnixStream, p: &Prompt) -> Result<(), String> {
         }
     };
     let theme = crate::theme::load(opts.theme.as_deref());
-    let mut ui = match Ui::open(theme, fonts) {
+    let mut ui = match Ui::open(theme, fonts, opts.size()) {
         Ok(u) => u,
         Err(e) => {
             send(s, "unavailable", p.id)?;

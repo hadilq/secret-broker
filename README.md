@@ -262,8 +262,19 @@ secret-broker fido2-enroll --name yubikey      # touch; prints a NixOS snippet:
 A ~1.3 MB Wayland layer-shell client (smithay-client-toolkit + fontdue,
 software rendering into wl_shm, links only libxkbcommon and libc). It works on
 any compositor with `wlr-layer-shell` (Hyprland, sway, river, niri, KDE…):
-an overlay layer surface with **exclusive keyboard**, centred, and no pointer
-input, so a click can't approve. It's themed from
+an overlay layer surface, centred, and no pointer input, so a click can't
+approve. Keyboard focus is **on demand**: the dialog gets the keyboard when it
+appears, but you can click another window (say, to look a password up) and
+type there, then click the dialog to come back. While it doesn't have the
+keyboard, the field greys out and says "Typing goes to another window. Click
+here to type." Losing focus never submits or denies anything. The surface is
+only the size of the card (no full-screen backdrop), so the rest of the
+screen stays clickable.
+
+Size: the default is 0.75 of the original layout (fonts and box together,
+420 px wide at scale 1; HiDPI scales on top). Change it with
+`programs.secret-broker.dialog.size` (0.5–2.0, e.g. `1.0` for the old size),
+`--size`, or `SECRET_BROKER_DIALOG_SIZE`. It's themed from
 `~/.local/state/omarchy/current/theme/colors.toml`.
 
 Up top: who asked (command, pid), the app it runs in (`foot (via Hyprland)`,
@@ -319,7 +330,7 @@ into the zeroized input buffer (which never reallocates) and the dialog says
 "pasted N characters". The clipboard itself is yours to clear (password
 managers do it after a while; `wl-copy --clear`). Ctrl+H draws the text without
 the glyph cache, so the characters don't stay behind in the font cache. These
-keys only work if your compositor doesn't bind them (Hyprland/Omarchy binds
+keys work while the dialog has the keyboard and only if your compositor doesn't bind them (Hyprland/Omarchy binds
 none of them).
 
 Why not iced/GTK/Qt: on this nixpkgs, pinentry-qt's closure is ~753 MiB and
@@ -330,7 +341,7 @@ without forks. The dialog has three modes:
 * `prompter` (systemd user service): registers with the broker, shows approvals.
 * `pinentry`: an Assuan pinentry, so the gpg unlock uses the same window
   (`pinentry-secret-broker`, which falls back to pinentry-curses without Wayland).
-* `demo [--pinentry] [--details] [--reveal] [--window]`: renders a sample (`--reveal`
+* `demo [--pinentry] [--details] [--reveal] [--unfocused] [--size N] [--window]`: renders a sample (`--reveal`
   shows a made-up value in clear).
 
 Without a running dialog, `secret-broker unlock` on a terminal asks for the PIN
