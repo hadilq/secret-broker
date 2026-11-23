@@ -527,6 +527,9 @@ in
         # clear, paste again with Shift+Insert, submit
         machine.succeed(h(f"{wl} wtype -s 400 -M ctrl u -m ctrl -s 100 -M shift -k Insert -m shift"))
         machine.sleep(1)
+        # fix a "typo" in the middle: Left Left, BackSpace drops the 4, type it again
+        machine.succeed(h(f"{wl} wtype -s 300 -k Left -k Left -k BackSpace -s 100 4"))
+        machine.sleep(1)
         machine.succeed(h(f"{wl} wtype -s 400 -k Return"))
         machine.wait_until_succeeds("test -e /tmp/real.rc", timeout=60)
         assert machine.succeed("cat /tmp/real.rc").strip() == "0", machine.succeed("cat /tmp/real.out /tmp/dialog-real.log")

@@ -188,6 +188,11 @@ programs.secret-broker.enable = true;
 # programs.secret-broker.dialog.enable = true;   # default; approval dialog user service
 ```
 
+`home-manager switch` restarts the dialog service when the dialog changes,
+and, with `gpgAgent.recommended`, reloads a running gpg-agent when the
+pinentry changes (gpg-agent otherwise keeps launching the old pinentry until
+it's restarted; by hand that's `gpgconf --kill gpg-agent`).
+
 ### The secrets file
 
 ```sh
@@ -317,8 +322,14 @@ that shows up in argv is shown and logged as [REDACTED].
 | Enter / Esc | submit / deny (cancel) |
 | Ctrl+V, Shift+Insert | paste from the clipboard |
 | Ctrl+H | show / hide what's typed (hidden by default; the field turns yellow while shown) |
+| Left / Right | move the cursor (Ctrl: by word) |
+| Home / End, Ctrl+A / Ctrl+E | start / end of the field (with Tab details open, Ctrl+Home/End scroll them) |
+| Backspace / Delete | delete before / after the cursor (Ctrl: a word) |
 | Ctrl+U | clear |
-| Ctrl+W, Ctrl+Backspace | delete the last word |
+| Ctrl+W | delete the word before the cursor |
+
+Typing and paste insert at the cursor, shown or hidden (hidden, the cursor
+sits between the dots).
 
 Paste reads the regular clipboard (`wl_data_device`, `text/plain;charset=utf-8`,
 `UTF8_STRING` or `text/plain`; not the primary selection) through a pipe that
@@ -341,7 +352,7 @@ without forks. The dialog has three modes:
 * `prompter` (systemd user service): registers with the broker, shows approvals.
 * `pinentry`: an Assuan pinentry, so the gpg unlock uses the same window
   (`pinentry-secret-broker`, which falls back to pinentry-curses without Wayland).
-* `demo [--pinentry] [--details] [--reveal] [--unfocused] [--size N] [--window]`: renders a sample (`--reveal`
+* `demo [--pinentry] [--details] [--reveal] [--unfocused] [--cursor N] [--size N] [--window]`: renders a sample (`--reveal`
   shows a made-up value in clear).
 
 Without a running dialog, `secret-broker unlock` on a terminal asks for the PIN

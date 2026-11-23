@@ -12,9 +12,12 @@
 //!
 //! Keys in the secret field: Ctrl+V / Shift+Insert paste from the clipboard
 //! (wl_data_device), Ctrl+H shows/hides what was typed, Ctrl+U clears,
-//! Ctrl+W / Ctrl+Backspace delete a word.
+//! Ctrl+W / Ctrl+Backspace delete a word. The cursor moves with Left/Right,
+//! Home/End (Ctrl+A/Ctrl+E), Ctrl+Left/Right by word; Delete and
+//! Ctrl+Delete delete forward. Typing and paste insert at the cursor.
 #![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 
+use crate::edit::Editor;
 use crate::render::{Canvas, Fonts};
 use crate::theme::{Rgb, Theme};
 use smithay_client_toolkit::reexports::client::{
@@ -128,7 +131,7 @@ struct App {
     scale: i32,
     width: u32,
     height: u32,
-    input: Zeroizing<String>,
+    input: Editor,
     events: VecDeque<UiEvent>,
     dirty: bool,
     view: View,
@@ -148,6 +151,8 @@ struct Paste {
 #[derive(Clone, Copy)]
 pub struct Field<'a> {
     pub len: usize,
+    /// Characters before the cursor.
+    pub cursor: usize,
     pub plain: Option<&'a str>,
     /// false: keyboard focus is in another window.
     pub focused: bool,
@@ -167,10 +172,13 @@ pub fn clamp_size(z: f32) -> f32 {
     }
 }
 
-fn new_input() -> Zeroizing<String> {
-    // Reserve once, so typing or pasting never reallocates and leaves a
-    // stale copy of the secret behind in freed memory.
-    Zeroizing::new(String::with_capacity(MAX_INPUT * 4))
+/// Which dots to draw when they don't all fit: `cap` of `len`, keeping the
+/// cursor (after `cursor` dots) in view. Returns (first, count).
+fn dot_window(len: usize, cursor: usize, cap: usize) -> (usize, usize) {
+    if len <= cap {
+        return (0, len);
+    }
+    (cursor.saturating_sub(cap).min(len - cap), cap)
 }
 
 /// Pick the clipboard type to ask for.
@@ -192,15 +200,6 @@ fn clean_paste(bytes: &[u8]) -> Result<&str, &'static str> {
     Ok(text)
 }
 
-/// Ctrl+W: drop trailing spaces, then the word before them.
-fn delete_word(s: &mut String) {
-    while s.ends_with(char::is_whitespace) {
-        s.pop();
-    }
-    while s.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
-        s.pop();
-    }
-}
 
 pub struct Ui {
     _conn: Connection,
@@ -253,7 +252,7 @@ impl Ui {
             scale: 1,
             width: w0,
             height: h0,
-            input: new_input(),
+            input: Editor::new(MAX_INPUT),
             events: VecDeque::new(),
             dirty: true,
             view: View::default(),
@@ -555,28 +554,37 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
         let lw = c.text(fonts, false, x + 14.0 * s, by, BODY_PX * s, label, t.muted);
         let mut dx = x + 14.0 * s + lw + 10.0 * s;
         let room = x + inner - 18.0 * s - dx;
+        let cursor_x;
         if let Some(plain) = field.plain {
-            // Show the end of the text if it doesn't fit (that's where the
-            // cursor is).
+            // Scroll so the cursor stays in view, then draw what fits.
             let px = BODY_PX * s;
+            let at = plain.char_indices().nth(field.cursor).map_or(plain.len(), |(i, _)| i);
             let mut start = 0;
-            while fonts.width_uncached(plain.get(start..).unwrap_or(""), px) > room {
-                match plain.get(start..).and_then(|r| r.chars().next()) {
-                    Some(ch) => start += ch.len_utf8(),
-                    None => break,
-                }
+            while start < at && fonts.width_uncached(plain.get(start..at).unwrap_or(""), px) > room {
+                start += plain.get(start..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8);
             }
-            let shown = plain.get(start..).unwrap_or("");
-            dx += c.secret_text(fonts, dx, by, px, shown, t.foreground) + 2.0 * s;
+            let mut end = at;
+            while let Some(ch) = plain.get(end..).and_then(|r| r.chars().next()) {
+                if fonts.width_uncached(plain.get(start..end + ch.len_utf8()).unwrap_or(""), px) > room {
+                    break;
+                }
+                end += ch.len_utf8();
+            }
+            let before = plain.get(start..at).unwrap_or("");
+            let shown = plain.get(start..end).unwrap_or("");
+            cursor_x = dx + fonts.width_uncached(before, px) + 1.0 * s;
+            c.secret_text(fonts, dx, by, px, shown, t.foreground);
         } else {
-            let n = field.len.min((room / (15.0 * s)).max(0.0) as usize);
+            let cap = (room / (15.0 * s)).max(0.0) as usize;
+            let (first, n) = dot_window(field.len, field.cursor, cap);
+            cursor_x = dx + (field.cursor - first) as f32 * 15.0 * s - 3.0 * s;
             for _ in 0..n {
                 c.round_rect(dx, by - 9.0 * s, 9.0 * s, 9.0 * s, 4.5 * s, t.foreground);
                 dx += 15.0 * s;
             }
         }
         if !v.busy && field.focused {
-            c.round_rect(dx, by - 15.0 * s, 2.0 * s, 19.0 * s, 1.0 * s, t.accent);
+            c.round_rect(cursor_x.max(x + 14.0 * s + lw + 8.0 * s), by - 15.0 * s, 2.0 * s, 19.0 * s, 1.0 * s, t.accent);
         }
         y = top + 44.0 * s;
         let keys = format!(
@@ -628,7 +636,8 @@ impl App {
         {
             let mut c = Canvas { w: pw, h: ph, data };
             let field = Field {
-                len: self.input.chars().count(),
+                len: self.input.chars(),
+                cursor: self.input.cursor_chars(),
                 plain: self.reveal.then_some(self.input.as_str()),
                 focused: self.focused,
             };
@@ -740,11 +749,10 @@ impl App {
             }
         };
         let n = text.chars().count();
-        if self.input.chars().count() + n > MAX_INPUT {
+        if !self.input.insert(text) {
             self.note(&format!("too long to paste (max {MAX_INPUT} characters)"), Tone::Error);
             return;
         }
-        self.input.push_str(text);
         self.note(&format!("pasted {n} characters"), Tone::Muted);
     }
 
@@ -765,8 +773,10 @@ impl App {
             Keysym::Down if self.view.show_details => self.scroll_by(1),
             Keysym::Page_Up if self.view.show_details => self.scroll_by(-(DETAIL_VISIBLE as isize - 2)),
             Keysym::Page_Down if self.view.show_details => self.scroll_by(DETAIL_VISIBLE as isize - 2),
-            Keysym::Home if self.view.show_details => self.scroll_by(-100_000),
-            Keysym::End if self.view.show_details => self.scroll_by(100_000),
+            // Home/End move the cursor when there's a field; then the
+            // details use Ctrl+Home/Ctrl+End.
+            Keysym::Home if self.view.show_details && (self.ctrl || self.view.field.is_none()) => self.scroll_by(-100_000),
+            Keysym::End if self.view.show_details && (self.ctrl || self.view.field.is_none()) => self.scroll_by(100_000),
             Keysym::Return | Keysym::KP_Enter => {
                 if self.view.busy {
                     return;
@@ -775,7 +785,7 @@ impl App {
                     if self.input.is_empty() {
                         return;
                     }
-                    let pin = std::mem::replace(&mut self.input, new_input());
+                    let pin = self.input.take();
                     self.paste = None;
                     self.events.push_back(UiEvent::Submit(pin));
                 } else {
@@ -783,23 +793,46 @@ impl App {
                 }
                 self.dirty = true;
             }
-            Keysym::BackSpace => {
-                if self.ctrl {
-                    delete_word(&mut self.input);
-                } else {
-                    self.input.pop();
+            Keysym::Insert if self.shift && !self.ctrl => self.start_paste(),
+            Keysym::BackSpace
+            | Keysym::Delete
+            | Keysym::KP_Delete
+            | Keysym::Left
+            | Keysym::KP_Left
+            | Keysym::Right
+            | Keysym::KP_Right
+            | Keysym::Home
+            | Keysym::KP_Home
+            | Keysym::End
+            | Keysym::KP_End => {
+                if self.view.field.is_none() || self.view.busy {
+                    return;
+                }
+                let e = &mut self.input;
+                match (ev.keysym, self.ctrl) {
+                    (Keysym::BackSpace, false) => e.backspace(),
+                    (Keysym::BackSpace, true) => e.delete_word_left(),
+                    (Keysym::Delete | Keysym::KP_Delete, false) => e.delete(),
+                    (Keysym::Delete | Keysym::KP_Delete, true) => e.delete_word_right(),
+                    (Keysym::Left | Keysym::KP_Left, false) => e.left(),
+                    (Keysym::Left | Keysym::KP_Left, true) => e.word_left(),
+                    (Keysym::Right | Keysym::KP_Right, false) => e.right(),
+                    (Keysym::Right | Keysym::KP_Right, true) => e.word_right(),
+                    (Keysym::Home | Keysym::KP_Home, _) => e.home(),
+                    _ => e.end(),
                 }
                 self.dirty = true;
             }
-            Keysym::Insert if self.shift && !self.ctrl => self.start_paste(),
             _ => {
                 if self.view.field.is_none() || self.view.busy {
                     return;
                 }
                 if self.ctrl {
                     match ev.keysym {
-                        Keysym::u | Keysym::U => zeroize::Zeroize::zeroize(&mut *self.input),
-                        Keysym::w | Keysym::W => delete_word(&mut self.input),
+                        Keysym::u | Keysym::U => self.input.clear(),
+                        Keysym::w | Keysym::W => self.input.delete_word_left(),
+                        Keysym::a | Keysym::A => self.input.home(),
+                        Keysym::e | Keysym::E => self.input.end(),
                         Keysym::h | Keysym::H => self.reveal = !self.reveal,
                         Keysym::v | Keysym::V => self.start_paste(),
                         _ => return,
@@ -808,10 +841,9 @@ impl App {
                     return;
                 }
                 if let Some(t) = ev.utf8.as_deref() {
+                    let mut buf = [0u8; 4];
                     for ch in t.chars().filter(|c| !c.is_control()) {
-                        if self.input.chars().count() < MAX_INPUT {
-                            self.input.push(ch);
-                        }
+                        let _ = self.input.insert(ch.encode_utf8(&mut buf));
                     }
                     self.dirty = true;
                 }
@@ -901,7 +933,10 @@ impl KeyboardHandler for App {
         self.key(ev);
     }
     fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
-        if matches!(ev.keysym, Keysym::BackSpace | Keysym::Up | Keysym::Down | Keysym::Page_Up | Keysym::Page_Down) {
+        if matches!(
+            ev.keysym,
+            Keysym::BackSpace | Keysym::Delete | Keysym::Left | Keysym::Right | Keysym::Up | Keysym::Down | Keysym::Page_Up | Keysym::Page_Down
+        ) {
             self.key(ev);
         }
     }
@@ -970,13 +1005,12 @@ mod tests {
     }
 
     #[test]
-    fn word_delete() {
-        let mut s = String::from("correct horse  ");
-        delete_word(&mut s);
-        assert_eq!(s, "correct ");
-        delete_word(&mut s);
-        assert_eq!(s, "");
-        delete_word(&mut s);
-        assert_eq!(s, "");
+    fn dots_follow_the_cursor() {
+        assert_eq!(dot_window(5, 5, 24), (0, 5));
+        assert_eq!(dot_window(30, 30, 24), (6, 24)); // end: last 24
+        assert_eq!(dot_window(30, 0, 24), (0, 24)); // Home: first 24
+        assert_eq!(dot_window(30, 10, 24), (0, 24));
+        assert_eq!(dot_window(30, 27, 24), (3, 24));
+        assert_eq!(dot_window(30, 30, 0), (30, 0)); // no room: nothing drawn
     }
 }

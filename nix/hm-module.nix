@@ -134,6 +134,8 @@ in
           Description = "secret-broker approval dialog";
           PartOf = [ "graphical-session.target" ];
           After = [ "graphical-session.target" ];
+          # restart on `home-manager switch` whenever the dialog changes
+          X-Restart-Triggers = [ "${dcfg.package}" ];
         };
         Service = {
           ExecStart = "${dcfg.package}/bin/secret-broker-dialog prompter ${fontArgs}";
@@ -152,6 +154,28 @@ in
         maxCacheTtl = lib.mkOverride 90 cfg.gpgAgent.maxCacheTtl;
         pinentry.package = lib.mkOverride 90 cfg.gpgAgent.pinentryPackage;
       };
+      # gpg-agent reads pinentry-program only when it starts or reloads, so
+      # after a switch it would keep running the old pinentry. Reload it
+      # (SIGHUP: re-reads gpg-agent.conf, keeps cached keys) when the
+      # pinentry package changed (gpg-connect-agent --no-autostart: no new agent
+      # unless systemd socket activation starts one, which then reads the new conf).
+      home.activation.secretBrokerReloadGpgAgent = mkIf config.services.gpg-agent.enable (
+        lib.hm.dag.entryAfter [ "writeBoundary" "linkGeneration" ] ''
+          sbStamp="${config.xdg.stateHome}/secret-broker/pinentry"
+          sbNew=${lib.escapeShellArg "${cfg.gpgAgent.pinentryPackage}"}
+          if [ "$(cat "$sbStamp" 2>/dev/null)" != "$sbNew" ]; then
+            if GNUPGHOME=${lib.escapeShellArg config.programs.gpg.homedir} \
+                ${config.programs.gpg.package}/bin/gpg-connect-agent --no-autostart /bye >/dev/null 2>&1; then
+              verboseEcho "secret-broker: pinentry changed, reloading gpg-agent"
+              run env GNUPGHOME=${lib.escapeShellArg config.programs.gpg.homedir} \
+                ${config.programs.gpg.package}/bin/gpgconf --reload gpg-agent
+            fi
+            if [ -z "''${DRY_RUN:-}" ]; then
+              mkdir -p "$(dirname "$sbStamp")" && printf '%s\n' "$sbNew" > "$sbStamp"
+            fi
+          fi
+        ''
+      );
     })
   ]);
 }

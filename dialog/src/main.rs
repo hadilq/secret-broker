@@ -7,6 +7,7 @@
 //! - `pinentry`: a gpg pinentry with the same look (first unlock after boot).
 //! - `demo`: render a sample dialog (to a PPM file, or in a window).
 
+mod edit;
 mod pinentry;
 mod procinfo;
 mod prompter;
@@ -20,7 +21,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   secret-broker-dialog [prompter] [--font FILE] [--font-bold FILE] [--theme colors.toml] [--size 0.75]
   secret-broker-dialog pinentry [--fallback /path/to/pinentry-curses] [--font FILE] ...
-  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--reveal] [--unfocused] [--window]
+  secret-broker-dialog demo [--out FILE.ppm] [--scale N] [--pinentry] [--details] [--reveal] [--unfocused] [--cursor N] [--window]
 ";
 
 #[derive(Debug, Default)]
@@ -155,6 +156,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let mut details = false;
     let mut reveal = false;
     let mut unfocused = false;
+    let mut cursor: Option<usize> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -165,6 +167,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
             "--details" => details = true,
             "--reveal" => reveal = true,
             "--unfocused" => unfocused = true,
+            "--cursor" => cursor = it.next().and_then(|v| v.parse().ok()),
             _ => {}
         }
     }
@@ -205,6 +208,7 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let sample = if pin_mode { "correct horse battery" } else { "424242" };
     let field = ui::Field {
         len: sample.chars().count(),
+        cursor: cursor.unwrap_or(usize::MAX).min(sample.chars().count()),
         plain: reveal.then_some(sample),
         focused: !unfocused,
     };
