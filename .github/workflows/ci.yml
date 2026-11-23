@@ -1,0 +1,77 @@
+# Runs the flake's checks on GitHub-hosted runners, including the NixOS VM
+# test (QEMU with KVM: ubuntu-24.04 runners expose /dev/kvm).
+#
+# Actions are pinned to full commit SHAs (tag in the comment). No secrets,
+# no binary cache that needs a token: nixpkgs comes from cache.nixos.org and
+# this repo's crates are built each run.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: eval, clippy, unit/integration tests, packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Evaluate every flake output
+        run: nix flake check --no-build -L
+      - name: clippy (-D warnings, no-panic lints)
+        run: nix build --no-link -L .#checks.x86_64-linux.clippy
+      - name: secret-broker (unit + integration tests)
+        run: nix build --no-link -L .#checks.x86_64-linux.package
+      - name: secret-broker-dialog (unit tests)
+        run: nix build --no-link -L .#checks.x86_64-linux.dialog
+
+  vm-test:
+    name: NixOS VM test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          test -w /dev/kvm
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: VM test (broker, ai-run, dialog on headless sway, audit log)
+        run: nix build -L -o vm-result .#checks.x86_64-linux.vm
+      - name: Collect the dialog screenshots
+        if: always()
+        run: |
+          mkdir -p vm-screenshots
+          if [ -e vm-result ]; then cp -L vm-result/*.png vm-screenshots/; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: vm-screenshots
+          path: vm-screenshots/
+          if-no-files-found: ignore
+          retention-days: 14

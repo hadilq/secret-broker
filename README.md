@@ -1,5 +1,7 @@
 # secret-broker
 
+[![CI](https://github.com/hadilq/secret-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/hadilq/secret-broker/actions/workflows/ci.yml)
+
 Let an AI agent (or any process running as you) **use** secrets through
 allowlisted commands, without being able to **read** them.
 
@@ -577,6 +579,12 @@ chance that a caught panic leaves the broker serving while locks are
 poisoned. systemd restarts it, and a restart is a lock (memory is gone).
 
 ## Development
+
+CI (`.github/workflows/ci.yml`) runs the same checks on GitHub Actions on
+every push and pull request: one job evaluates the flake and builds clippy,
+the package (unit + integration tests) and the dialog; another runs the NixOS
+VM test with KVM and uploads the dialog screenshots as the `vm-screenshots`
+artifact. Actions are pinned to commit SHAs; no secrets or tokened caches.
 
 ```sh
 nix develop
