@@ -75,3 +75,43 @@ jobs:
           path: vm-screenshots/
           if-no-files-found: ignore
           retention-days: 14
+
+  macos:
+    # Apple silicon runner (aarch64-darwin). Checks that the broker builds,
+    # passes clippy (-D warnings, no-panic lints) and its tests on macOS:
+    # getpeereid/LOCAL_PEERPID peer credentials, libproc caller details,
+    # the daemon over real sockets, and that the Linux-only parts (Wayland
+    # dialog, bubblewrap ai-run) refuse cleanly instead of crashing.
+    name: macOS (aarch64-darwin)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
+      - name: Evaluate the flake (this system)
+        run: nix flake check --no-build -L
+      - name: clippy for macOS (-D warnings, no-panic lints)
+        run: nix build --no-link -L .#checks.aarch64-darwin.clippy
+      - name: secret-broker (unit + integration tests, Nix build)
+        run: nix build --no-link -L .#checks.aarch64-darwin.package
+      - name: cargo test on the real filesystem (daemon tests must not skip)
+        shell: bash
+        run: |
+          nix develop -c cargo test --workspace --locked -- --nocapture 2>&1 | tee test.log
+          if grep -q '^SKIP' test.log; then
+            echo "::error::integration tests skipped on macOS"
+            exit 1
+          fi
+      - name: Linux-only parts refuse cleanly
+        shell: bash
+        run: |
+          nix develop -c cargo build --workspace --locked
+          set +e
+          target/debug/secret-broker-dialog prompter; dialog=$?
+          target/debug/secret-broker-dialog pinentry --fallback /usr/bin/true; pinentry=$?
+          target/debug/ai-run --config /dev/null -- /usr/bin/true; airun=$?
+          set -e
+          echo "dialog=$dialog pinentry=$pinentry ai-run=$airun"
+          test "$dialog" -eq 2 && test "$pinentry" -eq 0 && test "$airun" -eq 125

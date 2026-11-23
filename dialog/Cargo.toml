@@ -12,15 +12,19 @@ path = "src/main.rs"
 
 [dependencies]
 secret-broker = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["alloc"] }
+libc = "0.2"
+
+# The dialog is a Wayland layer-shell client: Linux only for now. On macOS
+# the binary builds without these and refuses the GUI modes cleanly.
+[target.'cfg(target_os = "linux")'.dependencies]
 # Wayland client + layer-shell + keyboard (xkbcommon), no toolkit. Pure-Rust
 # wire protocol (no libwayland); only libxkbcommon is linked.
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["xkbcommon"] }
 # Glyph rasterizer (no system font stack, no harfbuzz).
 fontdue = { version = "0.9", default-features = false, features = ["std", "simd"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-zeroize = { version = "1", features = ["alloc"] }
-libc = "0.2"
 
 [lints]
 workspace = true

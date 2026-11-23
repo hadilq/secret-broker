@@ -431,14 +431,19 @@ fn daemon(args: &[String]) -> Result<()> {
     // start it first, then drop every capability before any thread exists,
     // so neither the broker nor the commands it runs keep it.
     let caps_before = sys::effective_caps().unwrap_or(0);
-    let procs = match std::env::current_exe()
-        .map_err(Error::from)
-        .and_then(|exe| secret_broker::caller::Helper::spawn(&exe))
-    {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("warning: no /proc helper ({e}); caller details will be partial");
-            None
+    // macOS has no /proc to hide: the broker reads libproc itself.
+    let procs = if !cfg!(target_os = "linux") {
+        None
+    } else {
+        match std::env::current_exe()
+            .map_err(Error::from)
+            .and_then(|exe| secret_broker::caller::Helper::spawn(&exe))
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("warning: no /proc helper ({e}); caller details will be partial");
+                None
+            }
         }
     };
     sys::drop_all_caps()?;
@@ -492,15 +497,11 @@ fn install_signal_handler(srv: std::sync::Arc<server::Server>) -> Result<()> {
         }
     }
 
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: fds is a valid 2-element array for pipe2 to fill.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(Error::msg(format!(
-            "pipe2: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let [r, w] = fds;
+    let (r, w) = {
+        use std::os::fd::IntoRawFd;
+        let (r, w) = sys::pipe()?;
+        (r.into_raw_fd(), w.into_raw_fd())
+    };
     PIPE_W.store(w, Ordering::Relaxed);
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: on_signal only performs an async-signal-safe write(2).

@@ -13,7 +13,11 @@ const PAM_BUF_ERR: c_int = 5;
 const PAM_CONV_ERR: c_int = 19;
 const PAM_ERROR_MSG: c_int = 3;
 const PAM_TEXT_INFO: c_int = 4;
+#[cfg(target_os = "linux")]
 const PAM_SILENT: c_int = 0x8000;
+/// OpenPAM (macOS) uses a different bit than Linux-PAM.
+#[cfg(target_os = "macos")]
+const PAM_SILENT: c_int = i32::MIN; // 0x8000_0000
 
 #[repr(C)]
 struct PamMessage {

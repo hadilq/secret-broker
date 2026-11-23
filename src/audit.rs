@@ -56,7 +56,8 @@ impl Default for AuditConfig {
             directory: DEFAULT_DIR.into(),
             max_file_bytes: 10 * 1024 * 1024,
             keep_files: 9,
-            journal: true,
+            // journald is Linux-only (macOS: the file log only).
+            journal: cfg!(target_os = "linux"),
         }
     }
 }

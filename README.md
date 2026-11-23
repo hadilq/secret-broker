@@ -578,13 +578,55 @@ unwinding. That means no half-unwound state with secrets in it, and no
 chance that a caught panic leaves the broker serving while locks are
 poisoned. systemd restarts it, and a restart is a lock (memory is gone).
 
+## macOS
+
+The core is portable, and CI keeps it that way: the broker daemon,
+`secret-run`, sessions/PIN/fido2/PAM approval, the audit file and the
+terminal approval (`secret-broker unlock`). The flake exports `aarch64-darwin`
+packages and checks. Only the Linux mechanisms are swapped out:
+
+| Piece | Linux | macOS |
+|---|---|---|
+| Who is calling (the authorization input) | `SO_PEERCRED` | `getpeereid` + `LOCAL_PEERPID` (kernel-provided, same strength) |
+| Pinning the caller against pid reuse | pidfd (`SO_PEERPIDFD`) | 64-bit unique process id, re-checked after the snapshot |
+| Caller details | `/proc` (via the `CAP_SYS_PTRACE` helper) | libproc + `sysctl(KERN_PROCARGS2)`; app name from the `.app` bundle |
+| Anti-debug / dumps | `PR_SET_DUMPABLE=0`, `MADV_DONTDUMP`, `RLIMIT_CORE=0` | `PT_DENY_ATTACH`, `RLIMIT_CORE=0` (weaker, see below) |
+| Secret memory | `mlock` + zeroize | same |
+| Audit log | file + journald | file only (`journal` defaults to false) |
+| Default socket | `/run/secret-broker/broker.sock` | `/var/run/secret-broker/broker.sock` |
+
+Not supported yet. These fail with a clear message, never by running
+something unprotected:
+
+- **Approval dialog.** It is a Wayland layer-shell client, so on macOS
+  `secret-broker-dialog prompter` exits with an error. Approve with
+  `secret-broker unlock` in a terminal. `pinentry --fallback pinentry-mac`
+  execs pinentry-mac.
+- **ai-run.** It needs bubblewrap; on macOS `ai-run` refuses to start the
+  agent at all.
+- **Service modules.** There is no nix-darwin module (a launchd daemon)
+  yet. The HM module's dialog and ai-run parts assert Linux.
+
+The security model carries over only if the broker runs as **its own user**
+(a launchd daemon with `UserName`), like the `agent-secrets` system user on
+NixOS. The socket must sit in a root-created directory that only the allowed
+group can enter. On macOS the uid boundary is what keeps the agent out of
+the broker's memory: `PT_DENY_ATTACH` alone doesn't stop `task_for_pid` by
+root or by a debugger you authorize. Running the broker as yourself (a
+LaunchAgent) is not secure against an agent running as you. As on Linux, a
+broker running as another user sees less about callers: macOS shows another
+user's argv/cwd only to root, so expect "partly unreadable" notes there.
+
 ## Development
 
 CI (`.github/workflows/ci.yml`) runs the same checks on GitHub Actions on
 every push and pull request: one job evaluates the flake and builds clippy,
 the package (unit + integration tests) and the dialog; another runs the NixOS
 VM test with KVM and uploads the dialog screenshots as the `vm-screenshots`
-artifact. Actions are pinned to commit SHAs; no secrets or tokened caches.
+artifact. A third job runs on a macOS (Apple silicon) runner: clippy and
+the tests for `aarch64-darwin`, the daemon tests on the real filesystem (they
+fail the job if they skip), and checks that the Linux-only parts refuse
+cleanly. Actions are pinned to commit SHAs; no secrets or tokened caches.
 
 ```sh
 nix develop

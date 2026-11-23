@@ -56,6 +56,9 @@ impl SecretBuf {
             if libc::mlock(ptr, cap) != 0 {
                 MLOCK_FAILED.store(true, Ordering::Relaxed);
             }
+            // Keep it out of core dumps (Linux; macOS has no equivalent, but
+            // core dumps are disabled with RLIMIT_CORE=0 there anyway).
+            #[cfg(target_os = "linux")]
             libc::madvise(ptr, cap, libc::MADV_DONTDUMP);
             std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.cast::<u8>(), src.len());
         }

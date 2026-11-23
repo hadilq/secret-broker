@@ -305,7 +305,7 @@ impl Server {
 
     /// Who is on the other end of `stream`, snapshotted now.
     fn snapshot(&self, stream: &UnixStream, cred: PeerCred, restricted: bool) -> Caller {
-        let pidfd = sys::peer_pidfd(stream.as_raw_fd());
+        let pin = sys::peer_pin(stream.as_raw_fd(), cred.pid);
         let mut c = {
             let mut h = lock_any(&self.procs);
             match h.as_mut().and_then(|h| h.query(cred.pid)) {
@@ -314,7 +314,7 @@ impl Server {
                     if h.take().is_some() {
                         log("proc helper went away; reading /proc directly");
                     }
-                    caller::collect(&caller::Roots::default(), cred.pid)
+                    caller::collect_live(cred.pid)
                 }
             }
         };
@@ -330,17 +330,15 @@ impl Server {
         for p in &mut c.parents {
             p.argv = p.argv.iter().map(|a| self.redact_str(a)).collect();
         }
-        match pidfd {
-            Some(fd) => {
-                c.verified = sys::pidfd_alive(&fd);
+        match pin {
+            Some(pin) => {
+                c.verified = pin.alive();
                 if !c.verified {
                     c.notes
                         .push("the caller exited during the snapshot; its pid may be reused".into());
                 }
             }
-            None => c
-                .notes
-                .push("no SO_PEERPIDFD (kernel < 6.5): details are best effort".into()),
+            None => c.notes.push(sys::NO_PEER_PIN.into()),
         }
         c
     }

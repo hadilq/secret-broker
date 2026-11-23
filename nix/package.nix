@@ -1,5 +1,6 @@
 {
   lib,
+  stdenv,
   rustPlatform,
   gnupg,
   linux-pam,
@@ -30,7 +31,8 @@ rustPlatform.buildRustPackage {
 
   # libpam for the `pam-check` helper (fingerprint & other PAM approval
   # methods run in that separate process, never in the daemon).
-  buildInputs = [ linux-pam ];
+  # On macOS libpam (OpenPAM) comes with the SDK.
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ linux-pam ];
 
   # Absolute gpg/gpgconf/gpg-connect-agent fallback when they are not on PATH.
   env.SECRET_BROKER_GNUPG_BIN = "${gnupg}/bin";
@@ -44,7 +46,7 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Let AI agents use secrets through allowlisted commands without reading them";
     license = lib.licenses.mit;
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
     mainProgram = "secret-broker";
   };
 }

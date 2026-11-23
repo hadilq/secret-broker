@@ -2,7 +2,12 @@
 let
   cfg = config.programs.secret-broker;
   inherit (lib) mkOption mkEnableOption mkIf types;
-  defaultSocket = "/run/secret-broker/broker.sock";
+  # Must match DEFAULT_SOCKET in src/client.rs.
+  defaultSocket =
+    if pkgs.stdenv.hostPlatform.isDarwin then
+      "/var/run/secret-broker/broker.sock"
+    else
+      "/run/secret-broker/broker.sock";
   dcfg = cfg.dialog;
 
   fontArgs = lib.escapeShellArgs (
@@ -128,6 +133,12 @@ in
       home.sessionVariables = mkIf (cfg.socket != defaultSocket) { SECRET_BROKER_SOCKET = cfg.socket; };
     }
     (mkIf dcfg.enable {
+      assertions = [
+        {
+          assertion = pkgs.stdenv.hostPlatform.isLinux;
+          message = "programs.secret-broker.dialog: the approval dialog is a Wayland layer-shell client (Linux only); set programs.secret-broker.dialog.enable = false on macOS and approve with `secret-broker unlock` in a terminal.";
+        }
+      ];
       home.packages = [ dcfg.package ];
       systemd.user.services.secret-broker-dialog = {
         Unit = {

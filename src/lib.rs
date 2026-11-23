@@ -5,6 +5,9 @@
 //! (unwrap/expect/panic/indexing/slicing/arithmetic... are denied) and the
 //! `clippy` flake check, which fails the build on any violation.
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("secret-broker supports Linux and macOS only");
+
 pub mod approve;
 pub mod audit;
 pub mod caller;

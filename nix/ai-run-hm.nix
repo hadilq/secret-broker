@@ -286,6 +286,12 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = pkgs.stdenv.hostPlatform.isLinux;
+        message = "programs.ai-run: the sandbox uses bubblewrap (Linux only); a macOS sandbox-exec backend is not implemented yet.";
+      }
+    ];
     programs.ai-run.profiles = {
       default.description = lib.mkDefault "generic: credentials masked, no bus, no GUI";
       grok-build = {

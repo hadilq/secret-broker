@@ -1,6 +1,8 @@
 # `cargo clippy --all-targets -- -D warnings` as a derivation, so any lint
 # (including the no-panic lints in Cargo.toml) fails `nix flake check`.
 {
+  lib,
+  stdenv,
   secret-broker,
   clippy,
   pkg-config,
@@ -12,7 +14,8 @@ secret-broker.overrideAttrs (old: {
     clippy
     pkg-config
   ];
-  buildInputs = (old.buildInputs or [ ]) ++ [ libxkbcommon ];
+  # The dialog's Wayland deps are Linux-only (Cargo.toml target table).
+  buildInputs = (old.buildInputs or [ ]) ++ lib.optionals stdenv.hostPlatform.isLinux [ libxkbcommon ];
   buildPhase = ''
     runHook preBuild
     cargo clippy --offline --workspace --all-targets -- -D warnings

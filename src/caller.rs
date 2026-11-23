@@ -8,6 +8,12 @@
 //! pid per line on stdin and answers with one JSON line. It never reads
 //! environ or memory, and holds no secrets.
 //!
+//! macOS: there is no /proc; `collect_live` reads the same details with
+//! libproc (proc_pidinfo/proc_pidpath) and sysctl(KERN_PROCARGS2), see
+//! `darwin` below. No helper is needed there, but macOS only lets root (or
+//! the same user) read another process's argv/cwd, so a broker running as
+//! its own user gets uid/comm/parents and possibly not argv/cwd.
+//!
 //! Limits: a pid is only a name. The broker pins the caller with a pidfd
 //! (SO_PEERPIDFD) and checks it is still alive after the snapshot
 //! (`verified`), but parents are not pinned: one may exit and its pid be
@@ -334,6 +340,254 @@ pub fn collect(r: &Roots, pid: i32) -> Caller {
     c
 }
 
+/// Snapshot of a live process on this machine (uid/user/socket are filled
+/// in by the broker).
+pub fn collect_live(pid: i32) -> Caller {
+    #[cfg(target_os = "linux")]
+    {
+        collect(&Roots::default(), pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        darwin::collect(pid)
+    }
+}
+
+/// macOS tty device number -> /dev name (major 16 = pty slaves "ttysNNN";
+/// dev_t is major<<24 | minor).
+pub fn darwin_tty_name(dev: u32) -> String {
+    if dev == 0 || dev == u32::MAX {
+        return String::new();
+    }
+    let major = dev.wrapping_shr(24) & 0xff;
+    let minor = dev & 0x00ff_ffff;
+    match major {
+        16 => format!("/dev/ttys{minor:03}"),
+        0 => "/dev/console".into(),
+        _ => format!("tty {major}:{minor}"),
+    }
+}
+
+/// "/Applications/iTerm.app/Contents/MacOS/iTerm2" -> "iTerm": the
+/// outermost .app bundle in an executable path.
+pub fn app_bundle(exe: &str) -> Option<String> {
+    exe.split('/')
+        .find_map(|c| c.strip_suffix(".app").filter(|n| !n.is_empty()))
+        .map(|n| clean(n, 64))
+}
+
+/// Parse a KERN_PROCARGS2 buffer: argc (native int), the exec path,
+/// NUL padding, then argc NUL-terminated args. The environment that
+/// follows is never looked at.
+pub fn parse_procargs(buf: &[u8]) -> Vec<String> {
+    let Some((head, rest)) = buf.split_first_chunk::<4>() else {
+        return Vec::new();
+    };
+    let argc = usize::try_from(i32::from_ne_bytes(*head)).unwrap_or(0);
+    let mut parts = rest.split(|b| *b == 0);
+    // exec path, then padding (empty pieces)
+    let _ = parts.next();
+    parts
+        .skip_while(|p| p.is_empty())
+        .take(argc)
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+mod darwin {
+    use super::{app_bundle, clean, clip, darwin_tty_name, parse_procargs, MAX_ARG, MAX_ARGS, MAX_PARENTS, MAX_PARENT_ARG, MAX_PARENT_ARGS};
+    use crate::proto::{Caller, ProcInfo};
+    use std::mem::size_of;
+    use zeroize::Zeroizing;
+
+    struct Bsd {
+        comm: String,
+        ppid: i32,
+        ruid: u32,
+        tdev: u32,
+        /// Start time in microseconds since the epoch.
+        start: u64,
+    }
+
+    fn c_chars(v: &[libc::c_char]) -> String {
+        let bytes: Vec<u8> = v
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn bsd(pid: i32) -> Option<Bsd> {
+        // SAFETY: proc_bsdinfo is a plain C struct; all-zero is valid.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: info is a writable buffer of `size` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if n != size {
+            return None;
+        }
+        let name = c_chars(&info.pbi_name);
+        let comm = if name.is_empty() { c_chars(&info.pbi_comm) } else { name };
+        Some(Bsd {
+            comm: clean(&comm, 32),
+            ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
+            ruid: info.pbi_ruid,
+            tdev: info.e_tdev,
+            start: info
+                .pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(info.pbi_start_tvusec),
+        })
+    }
+
+    fn exe(pid: i32) -> String {
+        let mut buf = vec![0u8; 4096];
+        let len = u32::try_from(buf.len()).unwrap_or(0);
+        // SAFETY: buf is writable for `len` bytes.
+        let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), len) };
+        let n = usize::try_from(n).unwrap_or(0);
+        buf.get(..n)
+            .map(|b| clean(&String::from_utf8_lossy(b), MAX_ARG))
+            .unwrap_or_default()
+    }
+
+    fn cwd(pid: i32) -> String {
+        // SAFETY: proc_vnodepathinfo is a plain C struct; all-zero is valid.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let Ok(size) = libc::c_int::try_from(size_of::<libc::proc_vnodepathinfo>()) else {
+            return String::new();
+        };
+        // SAFETY: info is a writable buffer of `size` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+                size,
+            )
+        };
+        if n != size {
+            return String::new();
+        }
+        let flat: Vec<libc::c_char> = info.pvi_cdir.vip_path.iter().flatten().copied().collect();
+        clean(&c_chars(&flat), MAX_ARG)
+    }
+
+    fn argmax() -> usize {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let mut v: libc::c_int = 0;
+        let mut len = size_of::<libc::c_int>();
+        // SAFETY: mib/v/len are valid locals of the sizes passed.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut v as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r != 0 {
+            return 1 << 20;
+        }
+        usize::try_from(v).unwrap_or(1 << 20).clamp(4096, 4 << 20)
+    }
+
+    fn argv(pid: i32) -> Vec<String> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // Holds the process's environment too (possibly secrets): zeroized
+        // on drop.
+        let mut buf = Zeroizing::new(vec![0u8; argmax()]);
+        let mut len = buf.len();
+        // SAFETY: mib is 3 ints; buf is writable for `len` bytes.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r != 0 {
+            return Vec::new();
+        }
+        buf.get(..len).map(parse_procargs).unwrap_or_default()
+    }
+
+    pub fn collect(pid: i32) -> Caller {
+        let mut c = Caller {
+            pid,
+            snapshot_unix: crate::sys::now_unix_i64(),
+            ..Default::default()
+        };
+        let Some(st) = bsd(pid) else {
+            c.notes.push(
+                "process details unreadable (process gone, or another user's process: macOS only shows those to root)"
+                    .into(),
+            );
+            return c;
+        };
+        let args = argv(pid);
+        c.comm = st.comm.clone();
+        c.start_time = st.start;
+        c.exe = exe(pid);
+        c.cwd = cwd(pid);
+        c.argv = clip(&args, MAX_ARGS, MAX_ARG);
+        if c.exe.is_empty() || c.cwd.is_empty() || args.is_empty() {
+            c.notes
+                .push("exe/cwd/argv partly unreadable (macOS: another user's process)".into());
+        }
+        c.tty = darwin_tty_name(st.tdev);
+
+        let mut child_start = st.start;
+        let mut cur = st.ppid;
+        while cur > 0 && c.parents.len() < MAX_PARENTS {
+            let Some(ps) = bsd(cur) else { break };
+            if ps.start > child_start {
+                c.notes
+                    .push(format!("parent pid {cur} started after its child (pid reused); chain cut"));
+                break;
+            }
+            let pexe = exe(cur);
+            c.parents.push(ProcInfo {
+                pid: cur,
+                uid: ps.ruid,
+                comm: ps.comm.clone(),
+                exe: pexe,
+                argv: clip(&argv(cur), MAX_PARENT_ARGS, MAX_PARENT_ARG),
+            });
+            if cur == 1 {
+                break;
+            }
+            child_start = ps.start;
+            cur = ps.ppid;
+        }
+        // No systemd units on macOS: name the app by the nearest .app bundle
+        // (the terminal or IDE the command runs in).
+        if let Some(app) = std::iter::once(c.exe.as_str())
+            .chain(c.parents.iter().map(|p| p.exe.as_str()))
+            .find_map(app_bundle)
+        {
+            c.app = app;
+        }
+        c
+    }
+}
+
 /// The broker's end of the /proc helper.
 pub struct Helper {
     child: Child,
@@ -462,6 +716,41 @@ mod tests {
         assert!(is_bwrap("bwrap", &a));
     }
 
+    #[test]
+    fn darwin_helpers() {
+        assert_eq!(darwin_tty_name((16 << 24) | 3), "/dev/ttys003");
+        assert_eq!(darwin_tty_name(0), "");
+        assert_eq!(darwin_tty_name(u32::MAX), "");
+        assert_eq!(app_bundle("/Applications/iTerm.app/Contents/MacOS/iTerm2"), Some("iTerm".into()));
+        assert_eq!(
+            app_bundle("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper"),
+            Some("Visual Studio Code".into())
+        );
+        assert_eq!(app_bundle("/nix/store/x-zsh/bin/zsh"), None);
+    }
+
+    #[test]
+    fn procargs_parsing() {
+        let mut b = 3i32.to_ne_bytes().to_vec();
+        b.extend_from_slice(b"/bin/secret-run\0\0\0\0secret-run\0gh\0pr list\0HOME=/Users/h\0TOKEN=s3cret\0");
+        assert_eq!(parse_procargs(&b), vec!["secret-run", "gh", "pr list"]);
+        assert!(parse_procargs(&[1, 0]).is_empty());
+    }
+
+    #[test]
+    fn own_process_live() {
+        let me = i32::try_from(std::process::id()).unwrap();
+        let c = collect_live(me);
+        assert!(c.start_time > 0, "{:?}", c.notes);
+        assert!(!c.comm.is_empty());
+        assert!(!c.argv.is_empty(), "{:?}", c.notes);
+        assert!(!c.exe.is_empty(), "{:?}", c.notes);
+        assert!(!c.cwd.is_empty(), "{:?}", c.notes);
+        assert!(!c.parents.is_empty());
+        assert!(!collect_live(i32::MAX).notes.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn own_process() {
         let me = i32::try_from(std::process::id()).unwrap();

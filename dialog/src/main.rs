@@ -7,12 +7,24 @@
 //! - `pinentry`: a gpg pinentry with the same look (first unlock after boot).
 //! - `demo`: render a sample dialog (to a PPM file, or in a window).
 
+//!
+//! Wayland only (Linux). On macOS it builds but the GUI modes exit with an
+//! error; `pinentry --fallback PROG` execs PROG (e.g. pinentry-mac) instead.
+
+// Editing logic is portable (and tested everywhere); the rest is Wayland.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod edit;
+#[cfg(target_os = "linux")]
 mod pinentry;
+#[cfg(target_os = "linux")]
 mod procinfo;
+#[cfg(target_os = "linux")]
 mod prompter;
+#[cfg(target_os = "linux")]
 mod render;
+#[cfg(target_os = "linux")]
 mod theme;
+#[cfg(target_os = "linux")]
 mod ui;
 
 use std::path::PathBuf;
@@ -25,6 +37,7 @@ const USAGE: &str = "usage:
 ";
 
 #[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct Opts {
     pub font: Option<PathBuf>,
     pub font_bold: Option<PathBuf>,
@@ -34,6 +47,7 @@ pub struct Opts {
     pub size: Option<f32>,
 }
 
+#[cfg(target_os = "linux")]
 impl Opts {
     pub fn size(&self) -> f32 {
         let env = || std::env::var("SECRET_BROKER_DIALOG_SIZE").ok().and_then(|v| v.trim().parse().ok());
@@ -41,6 +55,7 @@ impl Opts {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn fc_match(pattern: &str) -> Option<PathBuf> {
     let out = std::process::Command::new("fc-match")
         .args(["--format=%{file}", pattern])
@@ -50,6 +65,7 @@ fn fc_match(pattern: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+#[cfg(target_os = "linux")]
 pub fn load_fonts(o: &Opts) -> Result<render::Fonts, String> {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let regular = o
@@ -68,6 +84,7 @@ pub fn load_fonts(o: &Opts) -> Result<render::Fonts, String> {
     render::Fonts::load(&r, b.as_deref())
 }
 
+#[cfg(target_os = "linux")]
 fn demo_prompt() -> secret_broker::proto::Prompt {
     use secret_broker::proto::{Caller, Owner, ProcInfo, SessionInfo};
     let now = secret_broker::sys::now_unix_i64();
@@ -148,6 +165,7 @@ fn demo_prompt() -> secret_broker::proto::Prompt {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
     let mut out = PathBuf::from("secret-broker-dialog.ppm");
     let mut scale = 1i32;
@@ -255,15 +273,41 @@ fn main() -> ExitCode {
             other => passthrough.push(other.to_string()),
         }
     }
-    match mode.as_str() {
-        "pinentry" => pinentry::run(&o, &passthrough),
-        "demo" => match demo(&o, &passthrough) {
+    run(&mode, &o, &passthrough)
+}
+
+#[cfg(target_os = "linux")]
+fn run(mode: &str, o: &Opts, passthrough: &[String]) -> ExitCode {
+    match mode {
+        "pinentry" => pinentry::run(o, passthrough),
+        "demo" => match demo(o, passthrough) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("secret-broker-dialog: {e}");
                 ExitCode::from(1)
             }
         },
-        _ => prompter::run(&o),
+        _ => prompter::run(o),
     }
+}
+
+/// No Wayland here: the pinentry can hand over to a native one (gpg-agent's
+/// pipes are inherited by exec); the approval dialog is not available.
+#[cfg(not(target_os = "linux"))]
+fn run(mode: &str, o: &Opts, passthrough: &[String]) -> ExitCode {
+    if mode == "pinentry" {
+        if let Some(fb) = &o.fallback {
+            use std::os::unix::process::CommandExt;
+            let e = std::process::Command::new(fb).args(passthrough).exec();
+            eprintln!("secret-broker-dialog: exec {fb}: {e}");
+            return ExitCode::from(1);
+        }
+        eprintln!("secret-broker-dialog: the built-in pinentry needs Wayland (Linux); pass --fallback /path/to/pinentry-mac");
+        return ExitCode::from(1);
+    }
+    eprintln!(
+        "secret-broker-dialog: the {mode} dialog needs Wayland and is not supported on this OS yet; \
+         run `secret-broker unlock` in a terminal to approve instead"
+    );
+    ExitCode::from(2)
 }

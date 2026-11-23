@@ -11,7 +11,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
 pub const DEFAULT_SOCKET: &str = "/run/secret-broker/broker.sock";
+/// macOS has no /run (nix-darwin's /run is a symlink set up at boot; use
+/// the real directory): a root-created, group-restricted dir.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SOCKET: &str = "/var/run/secret-broker/broker.sock";
 
 /// gnupg bin dir baked in at build time (fallback when not on PATH).
 const FALLBACK_GNUPG_BIN: Option<&str> = option_env!("SECRET_BROKER_GNUPG_BIN");
