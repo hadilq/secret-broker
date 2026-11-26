@@ -221,8 +221,10 @@ in
         # root-equivalent or session-wide sockets outside $XDG_RUNTIME_DIR
         "/run/docker.sock" "/run/podman" "/run/libvirt" "/run/dbus/system_bus_socket" "/run/pcscd"
         # secret-broker's full socket (unlock, approve, PIN, dialog); sandboxes
-        # use the restricted socket instead (see `env`)
+        # use the restricted socket instead (see `env`). Both spellings: on
+        # some systems /var/run is not a symlink to /run.
         "/run/secret-broker/broker.sock"
+        "/var/run/secret-broker/broker.sock"
         # the broker's audit log (who unlocked/ran what): yours to read, not the agent's
         "/var/log/secret-broker"
       ];

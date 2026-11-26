@@ -343,6 +343,33 @@ impl Server {
         c
     }
 
+    /// `want` empty means "do not check" (unpackaged / tests).
+    fn exe_matches(got: &str, want: &str) -> bool {
+        if want.is_empty() {
+            return true;
+        }
+        let got = got.strip_suffix(" (deleted)").unwrap_or(got);
+        if got.is_empty() {
+            return false;
+        }
+        if got == want {
+            return true;
+        }
+        std::fs::canonicalize(want).is_ok_and(|p| p.to_string_lossy() == got)
+    }
+
+    fn live_exe(&self, pid: i32) -> String {
+        let mut h = lock_any(&self.procs);
+        match h.as_mut().and_then(|h| h.query(pid)) {
+            Some(c) => c.exe,
+            None => caller::collect_live(pid).exe,
+        }
+    }
+
+    fn exe_allowed(&self, pid: i32, want: &str) -> bool {
+        Self::exe_matches(&self.live_exe(pid), want)
+    }
+
     fn session_info(&self) -> Option<SessionInfo> {
         let st = lock_state(&self.state);
         let mode = st.mode();
@@ -563,7 +590,14 @@ impl Server {
                 // The connection stays open; the dialog answers requests on it.
                 match self.register_prompter(&mut stream, &caller) {
                     Ok(()) => return,
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        self.audit(
+                            Event::new("prompter_register", "failed")
+                                .caller(&caller)
+                                .field("reason", e.to_string()),
+                        );
+                        proto::write_json(&mut stream, proto::T_JSON, &Response::err(e.to_string()))
+                    }
                 }
             }
             "exec" => self.exec(stream.try_clone(), &mut stream, &req, &caller),
@@ -631,6 +665,7 @@ impl Server {
                 env_vars: p.env.keys().cloned().collect(),
                 allow: p.allow.clone(),
                 deny: p.deny.clone(),
+                deny_tokens: p.deny_tokens.clone(),
                 unresolved,
             });
         }
@@ -861,6 +896,18 @@ impl Server {
     }
 
     fn register_prompter(self: &Arc<Self>, stream: &mut UnixStream, caller: &Caller) -> Result<()> {
+        let want = &self.cfg.approval.prompter_exe;
+        if !Self::exe_matches(&caller.exe, want) {
+            bail!(
+                "approval dialog must be {} (this process is {})",
+                want,
+                if caller.exe.is_empty() {
+                    "unknown"
+                } else {
+                    caller.exe.as_str()
+                }
+            );
+        }
         let ch = Arc::new(Channel::new(stream, caller.uid, caller.pid)?);
         proto::write_json(stream, proto::T_JSON, &ok_response())?;
         let old = lock_any(&self.prompter).replace(ch);
@@ -1024,7 +1071,15 @@ impl Server {
         ttl: Option<u64>,
         via: &str,
     ) -> Result<String> {
-        let (methods, phrase, attempts_left) = self.available_methods();
+        let (methods, mut phrase, attempts_left) = self.available_methods();
+        let want = if via == "dialog" {
+            self.cfg.approval.prompter_exe.as_str()
+        } else {
+            self.cfg.approval.client_exe.as_str()
+        };
+        if !self.exe_allowed(ch.pid, want) {
+            phrase.clear();
+        }
         let ev = |outcome: &str| {
             Event::new("approval", outcome)
                 .caller(caller)
@@ -1183,7 +1238,7 @@ impl Server {
         let Some(p) = self.cfg.profiles.get(&req.profile) else {
             return deny(stream, format!("unknown profile {:?}", req.profile));
         };
-        if let Err(msg) = crate::policy::check(&p.allow, &p.deny, &req.args) {
+        if let Err(msg) = crate::policy::check(&p.allow, &p.deny, &p.deny_tokens, &req.args) {
             return deny(stream, msg);
         }
         let home: PathBuf = Path::new(&self.cfg.state_dir)
@@ -1191,6 +1246,24 @@ impl Server {
             .join(&req.profile);
         if let Err(e) = std::fs::create_dir_all(&home) {
             return deny(stream, format!("state dir: {e}"));
+        }
+        let ids = if p.user.is_empty() {
+            None
+        } else {
+            match sys::ids_of(&p.user) {
+                Ok(ids) => Some(ids),
+                Err(e) => return deny(stream, format!("profile user {}: {e}", p.user)),
+            }
+        };
+        if let Some((uid, gid)) = ids {
+            let homes = Path::new(&self.cfg.state_dir).join("home");
+            // 0711: profile uids can traverse to their own home, not list siblings.
+            if let Err(e) = sys::chmod(&homes, 0o711)
+                .and_then(|()| sys::chown(&home, uid, gid))
+                .and_then(|()| sys::chmod(&home, 0o700))
+            {
+                return deny(stream, format!("profile home: {e}"));
+            }
         }
 
         // A sealed session needs a quick approval in the dialog first.
@@ -1223,7 +1296,7 @@ impl Server {
             }
         }
 
-        let mut child = match spawn(p, &req.profile, &home, &req.args, &values, req.stdin) {
+        let mut child = match spawn(p, &req.profile, &home, &req.args, &values, req.stdin, ids) {
             Ok(c) => c,
             Err(e) => return deny(stream, format!("start: {e}")),
         };
@@ -1410,6 +1483,7 @@ fn spawn(
     args: &[String],
     values: &[(String, Zeroizing<Vec<u8>>)],
     stdin: bool,
+    ids: Option<(u32, u32)>,
 ) -> std::io::Result<std::process::Child> {
     let path = if p.path.is_empty() {
         "/run/current-system/sw/bin"
@@ -1432,6 +1506,22 @@ fn spawn(
         .stderr(Stdio::piped());
     for (k, v) in values {
         cmd.env(k, OsStr::from_bytes(v));
+    }
+    // SAFETY: setuid/setgid then drop caps before exec; no heap allocation.
+    unsafe {
+        cmd.pre_exec(move || {
+            if let Some((uid, gid)) = ids {
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let _ = sys::set_non_dumpable();
+            let _ = sys::drop_all_caps();
+            Ok(())
+        });
     }
     let child = cmd.spawn();
     drop(cmd);

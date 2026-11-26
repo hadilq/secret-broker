@@ -223,13 +223,36 @@ fn run(args: &[String]) -> Result<ExitCode> {
         bwrap_args.extend(["--sync-fd".into(), fd.to_string()]);
     }
 
-    let err = Command::new(&cfg.bwrap)
+    let keep_fd: i32 = bwrap_args
+        .windows(2)
+        .find(|w| w.first().is_some_and(|x| x == "--sync-fd"))
+        .and_then(|w| w.get(1)?.parse().ok())
+        .unwrap_or(-1);
+    let mut bwrap = Command::new(&cfg.bwrap);
+    bwrap
         .args(&bwrap_args)
         .arg("--")
         .args(&cmd)
         .env_clear()
-        .envs(plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .exec();
+        .envs(plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // SAFETY: close leftover inherited fds (a host broker.sock) before exec.
+    // stdin/stdout/stderr and the optional dbus-proxy sync-fd stay.
+    unsafe {
+        bwrap.pre_exec(move || {
+            if keep_fd >= 3 {
+                let mut fd = 3;
+                while fd < keep_fd {
+                    sys::close_fd(fd);
+                    fd = fd.saturating_add(1);
+                }
+                sys::close_from(u32::try_from(keep_fd.saturating_add(1)).unwrap_or(u32::MAX));
+            } else {
+                sys::close_from(3);
+            }
+            Ok(())
+        });
+    }
+    let err = bwrap.exec();
     bail!("exec {}: {err}", cfg.bwrap)
 }
 

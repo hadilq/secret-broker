@@ -22,6 +22,10 @@ pub struct Profile {
     pub path: String,
     pub allow: Vec<Vec<String>>,
     pub deny: Vec<Vec<String>>,
+    /// Globs matched against every argument, any position (`--hostname`, `--debug`).
+    pub deny_tokens: Vec<String>,
+    /// Login the child runs as. Empty: the broker's own uid (tests).
+    pub user: String,
     pub timeout_seconds: u64,
 }
 
@@ -53,6 +57,13 @@ pub struct Approval {
     pub fido2: Fido2Config,
     /// Extra PAM-based methods (fingerprint, ...), checked in a helper process.
     pub pam: Vec<PamMethod>,
+    /// Absolute path of `secret-broker-dialog`. When set, only that binary
+    /// may register as the approval prompter (so it is the only client that
+    /// is sent the anti-phishing phrase). Empty: any client on broker.sock.
+    pub prompter_exe: String,
+    /// Absolute path of `secret-broker`. When set, terminal approve/unlock
+    /// is sent the phrase only if the caller is this binary.
+    pub client_exe: String,
 }
 
 impl Default for Approval {
@@ -63,6 +74,8 @@ impl Default for Approval {
             pin: PinConfig::default(),
             fido2: Fido2Config::default(),
             pam: Vec::new(),
+            prompter_exe: String::new(),
+            client_exe: String::new(),
         }
     }
 }
@@ -222,6 +235,12 @@ pub fn load(path: &str) -> Result<Config> {
     }
     if !a.fido2.credentials.is_empty() && !a.fido2.tools_dir.starts_with('/') {
         bail!("approval.fido2.tools_dir must be an absolute path");
+    }
+    if !a.prompter_exe.is_empty() && !a.prompter_exe.starts_with('/') {
+        bail!("approval.prompter_exe must be an absolute path");
+    }
+    if !a.client_exe.is_empty() && !a.client_exe.starts_with('/') {
+        bail!("approval.client_exe must be an absolute path");
     }
     for cred in &mut a.fido2.credentials {
         if cred.kind.is_empty() {

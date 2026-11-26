@@ -642,6 +642,10 @@ impl Drop for Helper {
 /// `secret-broker proc-helper`: answer pid lines with Caller JSON lines.
 pub fn helper_main() -> Result<()> {
     let _ = crate::sys::set_non_dumpable();
+    // Keep only SYS_PTRACE (to read /proc); drop SETUID/SETGID inherited
+    // from the daemon.
+    let have = crate::sys::effective_caps().unwrap_or(0);
+    let _ = crate::sys::drop_caps_keep(have & (1u64 << crate::sys::CAP_SYS_PTRACE));
     // Inherited from the daemon (systemd's listening sockets): not ours.
     crate::sys::close_from(3);
     let roots = Roots::default();

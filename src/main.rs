@@ -266,6 +266,9 @@ fn print_status(st: &Status) {
         for d in &p.deny {
             println!("               deny:  {}", d.join(" "));
         }
+        if !p.deny_tokens.is_empty() {
+            println!("               deny tokens: {}", p.deny_tokens.join(" "));
+        }
         if !p.unresolved.is_empty() {
             println!(
                 "               MISSING in secrets file: {}",
@@ -427,10 +430,17 @@ fn daemon(args: &[String]) -> Result<()> {
         }
     }
     let cfg_path = cfg_path.ok_or_else(|| Error::msg("--config is required"))?;
+    let cfg = config::load(&cfg_path)?;
     // The unit may grant CAP_SYS_PTRACE (ambient) for the /proc helper only:
     // start it first, then drop every capability before any thread exists,
-    // so neither the broker nor the commands it runs keep it.
+    // so neither the broker nor the commands it runs keep it. SETUID/SETGID
+    // stay if a profile names a user to exec as.
     let caps_before = sys::effective_caps().unwrap_or(0);
+    let keep_caps = if cfg.profiles.values().any(|p| !p.user.is_empty()) {
+        (1u64 << sys::CAP_SETUID) | (1u64 << sys::CAP_SETGID)
+    } else {
+        0
+    };
     // macOS has no /proc to hide: the broker reads libproc itself.
     let procs = if !cfg!(target_os = "linux") {
         None
@@ -446,8 +456,8 @@ fn daemon(args: &[String]) -> Result<()> {
             }
         }
     };
-    sys::drop_all_caps()?;
-    if sys::effective_caps().unwrap_or(0) != 0 {
+    sys::drop_caps_keep(keep_caps)?;
+    if sys::effective_caps().unwrap_or(0) != keep_caps {
         return Err(Error::msg("capabilities still present after dropping them"));
     }
     if let Err(e) = sys::set_non_dumpable() {
@@ -456,7 +466,6 @@ fn daemon(args: &[String]) -> Result<()> {
     if let Err(e) = sys::disable_core_dumps() {
         eprintln!("warning: {e}");
     }
-    let cfg = config::load(&cfg_path)?;
     let secrets_file = cfg.secrets_file.clone();
     let srv = server::Server::new(cfg, procs)?;
     let (listener, agent) = server::listeners(sock.as_deref(), agent_sock.as_deref())?;

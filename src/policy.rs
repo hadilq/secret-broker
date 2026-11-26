@@ -56,12 +56,27 @@ pub fn matches(rule: &[String], args: &[String]) -> bool {
 }
 
 /// `Ok(())` when `args` are allowed, otherwise a human-readable reason.
-pub fn check(allow: &[Vec<String>], deny: &[Vec<String>], args: &[String]) -> Result<(), String> {
+///
+/// `deny_tokens` are globs matched against every argument, any position.
+/// They run after positional deny rules and before allow, so a trailing `**`
+/// on an allow rule cannot sneak `--hostname` / `--debug` through.
+pub fn check(
+    allow: &[Vec<String>],
+    deny: &[Vec<String>],
+    deny_tokens: &[String],
+    args: &[String],
+) -> Result<(), String> {
     if args.iter().any(|a| a.contains('\0')) {
         return Err("argument contains a NUL byte".into());
     }
     if let Some(r) = deny.iter().find(|r| matches(r, args)) {
         return Err(format!("arguments {args:?} match deny rule {r:?}"));
+    }
+    if let Some(tok) = args
+        .iter()
+        .find(|a| deny_tokens.iter().any(|p| glob(p, a)))
+    {
+        return Err(format!("argument {tok:?} is denied"));
     }
     if allow.iter().any(|r| matches(r, args)) {
         Ok(())
@@ -109,6 +124,7 @@ mod tests {
             v(&["run", "**"]),
         ];
         let deny = vec![v(&["auth", "**"]), v(&["run", "token"])];
+        let none: &[String] = &[];
         for a in [
             v(&["pr", "list"]),
             v(&["pr", "view", "12"]),
@@ -117,7 +133,7 @@ mod tests {
             v(&["run", "list"]),
             v(&["run"]),
         ] {
-            assert!(check(&allow, &deny, &a).is_ok(), "{a:?}");
+            assert!(check(&allow, &deny, none, &a).is_ok(), "{a:?}");
         }
         for a in [
             v(&["pr"]),
@@ -128,7 +144,40 @@ mod tests {
             v(&[]),
             v(&["pr", "list\0"]),
         ] {
-            assert!(check(&allow, &deny, &a).is_err(), "{a:?}");
+            assert!(check(&allow, &deny, none, &a).is_err(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn deny_tokens_block_leaky_flags() {
+        let allow = vec![v(&["pr", "list", "**"]), v(&["api", "repos/*", "**"])];
+        let deny: Vec<Vec<String>> = vec![];
+        let toks = v(&[
+            "--hostname",
+            "--hostname=*",
+            "--debug",
+            "-v",
+            "--verbose",
+            "--config",
+            "--config=*",
+        ]);
+        assert!(check(&allow, &deny, &toks, &v(&["pr", "list"])).is_ok());
+        assert!(check(&allow, &deny, &toks, &v(&["api", "repos/x"])).is_ok());
+        assert!(check(&allow, &deny, &toks, &v(&["pr", "list", "--json"])).is_ok());
+        for a in [
+            v(&["pr", "list", "--hostname", "evil.com"]),
+            v(&["pr", "list", "--hostname=evil.com"]),
+            v(&["api", "repos/x", "--debug"]),
+            v(&["api", "repos/x", "-v"]),
+            v(&["pr", "list", "--verbose"]),
+            v(&["api", "repos/x", "--config", "/tmp/gh.yml"]),
+            v(&["pr", "list", "--config=/tmp/gh.yml"]),
+        ] {
+            let err = check(&allow, &deny, &toks, &a).err();
+            assert!(
+                err.as_ref().is_some_and(|e| e.contains("is denied")),
+                "{a:?}: {err:?}"
+            );
         }
     }
 }

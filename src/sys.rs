@@ -4,6 +4,7 @@ use crate::bail;
 use crate::error::{Error, Result};
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 
 fn last_os_error(what: &str) -> Error {
     Error::msg(format!("{what}: {}", std::io::Error::last_os_error()))
@@ -147,6 +148,66 @@ pub fn uid_of(name: &str) -> Result<u32> {
         bail!("no such user: {name}");
     }
     Ok(pwd.pw_uid)
+}
+
+/// Resolve a user name to uid and primary gid.
+pub fn ids_of(name: &str) -> Result<(u32, u32)> {
+    let cname = CString::new(name).map_err(|_| Error::msg("user name contains NUL"))?;
+    let mut pwd: libc::passwd = {
+        // SAFETY: passwd is a plain C struct; all-zero is a valid (empty) value.
+        unsafe { std::mem::zeroed() }
+    };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: same as uid_of.
+    let r = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if r != 0 {
+        bail!(
+            "getpwnam_r({name}): {}",
+            std::io::Error::from_raw_os_error(r)
+        );
+    }
+    if result.is_null() {
+        bail!("no such user: {name}");
+    }
+    Ok((pwd.pw_uid, pwd.pw_gid))
+}
+
+pub fn chown(path: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::msg("path contains NUL"))?;
+    // SAFETY: c is a valid C string for the duration of the call.
+    let r = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+    if r != 0 {
+        return Err(last_os_error(&format!("chown {}", path.display())));
+    }
+    Ok(())
+}
+
+pub fn chmod(path: &std::path::Path, mode: u32) -> Result<()> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::msg("path contains NUL"))?;
+    // SAFETY: c is a valid C string for the duration of the call.
+    let r = unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) };
+    if r != 0 {
+        return Err(last_os_error(&format!("chmod {}", path.display())));
+    }
+    Ok(())
+}
+
+pub fn close_fd(fd: i32) {
+    // SAFETY: closing an integer descriptor; EBADF is ignored.
+    unsafe {
+        libc::close(fd);
+    }
 }
 
 pub fn getuid() -> u32 {
@@ -628,6 +689,13 @@ struct CapData {
 /// clear the ambient set, then empty effective/permitted/inheritable.
 #[cfg(target_os = "linux")]
 pub fn drop_all_caps() -> Result<()> {
+    drop_caps_keep(0)
+}
+
+/// Like `drop_all_caps`, but keep the bits in `keep` (Linux capability numbers
+/// as a mask, e.g. `(1 << CAP_SETUID) | (1 << CAP_SETGID)`).
+#[cfg(target_os = "linux")]
+pub fn drop_caps_keep(keep: u64) -> Result<()> {
     // SAFETY: prctl with integer arguments only.
     let r = unsafe {
         libc::prctl(
@@ -645,11 +713,20 @@ pub fn drop_all_caps() -> Result<()> {
         version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
         pid: 0,
     };
-    let data = [CapData {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    }; 2];
+    let lo = keep as u32;
+    let hi = (keep >> 32) as u32;
+    let data = [
+        CapData {
+            effective: lo,
+            permitted: lo,
+            inheritable: 0,
+        },
+        CapData {
+            effective: hi,
+            permitted: hi,
+            inheritable: 0,
+        },
+    ];
     // SAFETY: hdr and data are valid capset arguments for version 3 (two
     // CapData entries) and live across the call.
     let r = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) };
@@ -659,9 +736,18 @@ pub fn drop_all_caps() -> Result<()> {
     Ok(())
 }
 
+pub const CAP_SETGID: u64 = 6;
+pub const CAP_SETUID: u64 = 7;
+pub const CAP_SYS_PTRACE: u64 = 19;
+
 /// macOS has no capabilities: nothing to drop.
 #[cfg(target_os = "macos")]
 pub fn drop_all_caps() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn drop_caps_keep(_keep: u64) -> Result<()> {
     Ok(())
 }
 

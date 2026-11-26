@@ -42,12 +42,14 @@ let
       };
       allow = mkOption {
         type = types.listOf (types.listOf types.str);
-        example = [ [ "pr" "list" ] [ "pr" "view" "*" ] [ "api" "repos/*" "**" ] ];
+        example = [ [ "pr" "list" ] [ "pr" "view" "*" ] [ "api" "repos/*" ] ];
         description = ''
           Allowed argument shapes, matched position by position. In a token,
           `*` matches anything (including `/`) and `?` one character; a whole
           `**` token matches all remaining arguments. Without `**` the number of
           arguments must match exactly. Use `[ [ "**" ] ]` to allow anything.
+          A trailing `**` lets callers pass flags such as `--hostname` or
+          `--debug`; pair it with `denyTokens` if you use it.
         '';
       };
       deny = mkOption {
@@ -55,6 +57,16 @@ let
         default = [ ];
         example = [ [ "auth" "**" ] ];
         description = "Argument shapes refused even if an allow rule matches.";
+      };
+      denyTokens = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" ];
+        description = ''
+          Globs matched against every argument, any position. Use this for
+          flags that print or redirect credentials (`--debug`, `--hostname`)
+          even when an allow rule ends in `**`.
+        '';
       };
       timeout = mkOption {
         type = types.int;
@@ -142,16 +154,20 @@ let
       default_cache_ttl = cfg.gpgCacheLimits.defaultCacheTtl;
       max_cache_ttl = cfg.gpgCacheLimits.maxCacheTtl;
     };
-    profiles = lib.mapAttrs (_: p: {
+    profiles = lib.mapAttrs (name: p: {
       inherit (p) description command env allow deny;
+      deny_tokens = p.denyTokens;
       fixed_args = p.fixedArgs;
       extra_env = p.extraEnv;
       path = lib.makeBinPath p.path;
       timeout_seconds = p.timeout;
+      user = "sb-${name}";
     }) enabledProfiles;
     approval = {
       timeout_seconds = acfg.timeout;
       sealed_max_seconds = acfg.sealedTimeout;
+      prompter_exe = if acfg.prompterExe == null then "" else acfg.prompterExe;
+      client_exe = if acfg.clientExe == null then "" else acfg.clientExe;
       pin = {
         inherit (acfg.pin) enable;
         min_length = acfg.pin.minLength;
@@ -189,6 +205,13 @@ in
       type = types.package;
       default = pkgs.callPackage ./package.nix { };
       defaultText = literalExpression "secret-broker";
+    };
+
+    dialogPackage = mkOption {
+      type = types.package;
+      default = pkgs.callPackage ./dialog.nix { };
+      defaultText = literalExpression "secret-broker-dialog";
+      description = "Approval dialog binary; used as the default `approval.prompterExe`.";
     };
 
     secretsFile = mkOption {
@@ -329,6 +352,26 @@ in
         default = 120;
         description = "Seconds an approval dialog waits before refusing.";
       };
+      prompterExe = mkOption {
+        type = types.nullOr types.str;
+        default = "${cfg.dialogPackage}/bin/secret-broker-dialog";
+        defaultText = literalExpression ''"''${config.services.secret-broker.dialogPackage}/bin/secret-broker-dialog"'';
+        description = ''
+          Absolute path of the only binary allowed to register as the approval
+          dialog. That process is the only client sent the anti-phishing phrase.
+          `null` disables the check (protocol-level tests).
+        '';
+      };
+      clientExe = mkOption {
+        type = types.nullOr types.str;
+        default = "${cfg.package}/bin/secret-broker";
+        defaultText = literalExpression ''"''${config.services.secret-broker.package}/bin/secret-broker"'';
+        description = ''
+          Absolute path of `secret-broker`. Terminal approve/unlock is sent the
+          anti-phishing phrase only when the caller is this binary. `null`
+          disables the check.
+        '';
+      };
       sealedTimeout = mkOption {
         type = types.ints.unsigned;
         default = 0;
@@ -437,14 +480,29 @@ in
   };
 
   config = mkIf cfg.enable {
-    users.users.agent-secrets = {
-      isSystemUser = true;
-      group = "agent-secrets";
-      home = "/var/lib/secret-broker";
-      description = "secret-broker daemon";
-    };
-    users.groups.agent-secrets = { };
-    users.groups.${cfg.group}.members = cfg.users;
+    users.users = {
+      agent-secrets = {
+        isSystemUser = true;
+        group = "agent-secrets";
+        home = "/var/lib/secret-broker";
+        description = "secret-broker daemon";
+      };
+    }
+    // lib.mapAttrs' (
+      name: _:
+      lib.nameValuePair "sb-${name}" {
+        isSystemUser = true;
+        group = "sb-${name}";
+        home = "/var/lib/secret-broker/home/${name}";
+        createHome = false;
+        description = "secret-broker profile ${name}";
+      }
+    ) enabledProfiles;
+    users.groups = {
+      agent-secrets = { };
+      ${cfg.group}.members = cfg.users;
+    }
+    // lib.mapAttrs' (name: _: lib.nameValuePair "sb-${name}" { }) enabledProfiles;
 
     environment.systemPackages = [ cfg.package ];
     # `secret-broker log` reads the file directly (group read).
@@ -494,8 +552,22 @@ in
         NoNewPrivileges = true;
         # Only for the /proc helper (see callerDetails); the daemon drops it
         # at start, before it serves anything.
-        CapabilityBoundingSet = if cfg.callerDetails then "CAP_SYS_PTRACE" else "";
-        AmbientCapabilities = if cfg.callerDetails then "CAP_SYS_PTRACE" else "";
+        # SETUID/SETGID: drop to sb-<profile> before exec. SYS_PTRACE is
+        # dropped in the daemon after the /proc helper is spawned.
+        CapabilityBoundingSet = lib.concatStringsSep " " (
+          [
+            "CAP_SETUID"
+            "CAP_SETGID"
+          ]
+          ++ lib.optionals cfg.callerDetails [ "CAP_SYS_PTRACE" ]
+        );
+        AmbientCapabilities = lib.concatStringsSep " " (
+          [
+            "CAP_SETUID"
+            "CAP_SETGID"
+          ]
+          ++ lib.optionals cfg.callerDetails [ "CAP_SYS_PTRACE" ]
+        );
         PrivateTmp = true;
         # FIDO2 keys are /dev/hidraw*: only those, through the device cgroup.
         PrivateDevices = !fido2Enabled;

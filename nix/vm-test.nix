@@ -140,7 +140,7 @@ let
   aiRunConfig = pkgs.writeText "ai-run.json" (builtins.toJSON {
     bwrap = "${pkgs.bubblewrap}/bin/bwrap";
     dbus_proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
-    mask = [ ".gnupg" ".config/gh" ".zsh_history" ".agent-login" "/run/docker.sock" "/run/secret-broker/broker.sock" "/var/log/secret-broker" ];
+    mask = [ ".gnupg" ".config/gh" ".zsh_history" ".agent-login" "/run/docker.sock" "/run/secret-broker/broker.sock" "/var/run/secret-broker/broker.sock" "/var/log/secret-broker" ];
     env.SECRET_BROKER_SOCKET = "/run/secret-broker/agent.sock";
     writable = [ "dev" ];
     env_unset = [ "DISPLAY" ];
@@ -207,7 +207,15 @@ in
         allow = [ [ "hash" ] [ "leak" ] [ "whoami" ] [ "cat" ] [ "sleep" ] ];
         deny = [ [ "env" ] ];
       };
+      profiles.other = {
+        command = "${pkgs.coreutils}/bin/cat";
+        allow = [ [ "*" ] ];
+      };
       approval = {
+        # fake-dialog is a Python stand-in; the exe check is covered by unit tests
+        # and would reject it (`/proc/pid/exe` is the interpreter).
+        prompterExe = null;
+        clientExe = null;
         # long enough for the sway subtest's focus steps; nothing waits for it
         timeout = 120;
         pin.minLength = 4;
@@ -277,8 +285,12 @@ in
         machine.succeed(h("secret-broker unlock --ttl 1h"))
         out = machine.succeed(h("secret-run demo hash")).strip()
         assert out == hashlib.sha256(SECRET.encode()).hexdigest(), out
-        assert machine.succeed(h("secret-run demo whoami")).strip() == "agent-secrets"
+        assert machine.succeed(h("secret-run demo whoami")).strip() == "sb-demo"
         assert machine.succeed(h("echo hi | secret-run demo cat")).strip() == "hi"
+        machine.succeed("install -m 600 -o sb-demo -g sb-demo /dev/null /var/lib/secret-broker/home/demo/marker")
+        machine.fail(h("secret-run other /var/lib/secret-broker/auth/pin"))
+        machine.fail(h("secret-run other /var/lib/secret-broker/home/demo/marker"))
+        assert "sb-demo" in machine.succeed("stat -c %U /var/lib/secret-broker/home/demo")
 
     with subtest("no command returns the secret"):
         leak = machine.succeed(h("secret-run demo leak"))
@@ -292,8 +304,8 @@ in
 
     with subtest("caller cannot read the child's or the broker's memory/environment"):
         machine.succeed(h("nohup secret-run demo sleep >/dev/null 2>&1 &"))
-        machine.wait_until_succeeds("pgrep -u agent-secrets -x sleep", timeout=60)
-        pid = machine.succeed("pgrep -u agent-secrets -x sleep | head -1").strip()
+        machine.wait_until_succeeds("pgrep -u sb-demo -x sleep", timeout=60)
+        pid = machine.succeed("pgrep -u sb-demo -x sleep | head -1").strip()
         # sanity: the secret really is in the child's environment (root can see it)
         machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ | grep -q '^DEMO_TOKEN='")
         machine.fail(h(f"cat /proc/{pid}/environ"))
@@ -306,13 +318,13 @@ in
         # The broker keeps no capability; only its /proc helper has
         # CAP_SYS_PTRACE (bit 19); commands it runs get none, and don't
         # inherit the listening sockets.
-        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{bpid}/status").strip() == "0000000000000000"
+        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{bpid}/status").strip() == "00000000000000c0"
         hpid = machine.succeed(f"pgrep -P {bpid} -f proc-helper").strip()
         assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{hpid}/status").strip() == "0000000000080000"
         assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{pid}/status").strip() == "0000000000000000"
         fds = machine.succeed(f"ls /proc/{pid}/fd").split()
         assert sorted(fds) == ["0", "1", "2"], fds
-        machine.succeed("pkill -u agent-secrets -x sleep || true")
+        machine.succeed("pkill -u sb-demo -x sleep || true")
 
     with subtest("ai-run: credentials masked, home read-only, broker reachable"):
         machine.succeed(h("mkdir -p ~/.config/gh ~/dev ~/.agent-login && chmod 700 ~/.gnupg"))

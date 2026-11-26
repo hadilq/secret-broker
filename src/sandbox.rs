@@ -205,6 +205,32 @@ const ALWAYS_UNSET: &[&str] = &[
     "TMPDIR",
 ];
 
+/// Full (unlock/approve/PIN) socket. Sandboxes may only see agent.sock.
+const BROKER_SOCK: &[&str] = &[
+    "/run/secret-broker/broker.sock",
+    "/var/run/secret-broker/broker.sock",
+];
+const AGENT_SOCK: &str = "/run/secret-broker/agent.sock";
+const BROKER_DIR: &[&str] = &["/run/secret-broker", "/var/run/secret-broker"];
+
+fn is_broker_sock(p: &Path) -> bool {
+    BROKER_SOCK.iter().any(|s| p == Path::new(s))
+}
+
+fn is_forbidden_writable(p: &Path) -> bool {
+    const ROOTS: &[&str] = &[
+        "/", "/run", "/var", "/var/run", "/etc", "/usr", "/dev", "/proc", "/sys",
+    ];
+    if ROOTS.iter().any(|s| p == Path::new(s)) {
+        return true;
+    }
+    BROKER_DIR.iter().any(|s| p == Path::new(s) || p.starts_with(s))
+}
+
+fn points_at_broker_sock(v: &str) -> bool {
+    BROKER_SOCK.contains(&v)
+}
+
 pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan> {
     let Some(prof) = cfg.profiles.get(name) else {
         let known: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
@@ -239,6 +265,21 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         push(&["--new-session"]);
     }
     let mut p = Plan::default();
+
+    // Hide the full broker socket even if it appears after we start: a tmpfs
+    // on the directory, /dev/null over broker.sock, then bind only agent.sock.
+    let mut sock_dirs: Vec<PathBuf> = Vec::new();
+    for (d, sock) in BROKER_DIR.iter().zip(BROKER_SOCK) {
+        let path = PathBuf::from(d);
+        let key = fs.resolve(&path).unwrap_or(path);
+        if sock_dirs.iter().any(|x| x == &key) {
+            continue;
+        }
+        sock_dirs.push(key);
+        push(&["--tmpfs", d]);
+        push(&["--ro-bind-try", "/dev/null", sock]);
+    }
+    push(&["--bind-try", AGENT_SOCK, AGENT_SOCK]);
 
     // /tmp: per-profile, shared by that profile's instances (Electron's
     // single-instance socket lives there), never the host's.
@@ -302,6 +343,9 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
     for w in &cfg.writable {
         let path = expand(home, w)?;
         if let Some(r) = fs.resolve(&path).filter(|r| !in_store(r)) {
+            if is_forbidden_writable(&r) {
+                bail!("writable {w:?} resolves to {}, which would expose the host", r.display());
+            }
             a.extend(["--bind".into(), s(&r), s(&r)]);
         }
     }
@@ -314,6 +358,9 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
                 path
             }
         };
+        if is_forbidden_writable(&r) {
+            bail!("writable {w:?} resolves to {}, which would expose the host", r.display());
+        }
         if !in_store(&r) {
             a.extend(["--bind".into(), s(&r), s(&r)]);
         }
@@ -330,6 +377,12 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
             .resolve(&path)
             .filter(|r| !in_store(r) && fs.kind(r) == Kind::Dir)
         {
+            if is_forbidden_writable(&r) {
+                bail!(
+                    "writable_from_env {var}={v:?} resolves to {}, which would expose the host",
+                    r.display()
+                );
+            }
             a.extend(["--bind".into(), s(&r), s(&r)]);
         }
     }
@@ -346,6 +399,11 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         .iter()
         .map(|u| expand(home, u))
         .collect::<Result<_>>()?;
+    for u in &unmask {
+        if is_broker_sock(u) {
+            bail!("unmask of the full broker socket is not allowed");
+        }
+    }
     for m in cfg.mask.iter().chain(&prof.extra_mask) {
         let path = expand(home, m)?;
         if unmask.contains(&path) {
@@ -392,6 +450,11 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
     );
     env.extend(prof.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.push(("AI_RUN_PROFILE".into(), name.to_string()));
+    if let Some((_, v)) = env.iter().find(|(k, _)| k == "SECRET_BROKER_SOCKET") {
+        if points_at_broker_sock(v) {
+            bail!("SECRET_BROKER_SOCKET must not point at the full broker socket");
+        }
+    }
     if !prof.path_prefix.is_empty() {
         let old = env_get(&env, "PATH")
             .unwrap_or("/run/current-system/sw/bin")
@@ -518,6 +581,16 @@ mod tests {
         let p = plan(&cfg(), "default", &ctx(), &fs()).unwrap();
         let a = &p.args;
         assert!(has(a, &["--ro-bind", "/", "/"]));
+        assert!(has(a, &["--tmpfs", "/run/secret-broker"]));
+        assert!(has(a, &["--bind-try", "/run/secret-broker/agent.sock", "/run/secret-broker/agent.sock"]));
+        assert!(has(
+            a,
+            &[
+                "--ro-bind-try",
+                "/dev/null",
+                "/run/secret-broker/broker.sock"
+            ]
+        ));
         assert!(has(a, &["--unshare-pid"]));
         assert!(!a.iter().any(|x| x == "--new-session"));
         assert!(has(a, &["--perms", "0700", "--tmpfs", "/run/user/1000"]));
@@ -662,5 +735,42 @@ mod tests {
         assert!(Config::parse(br#"{"bwrap":"bwrap"}"#).is_err());
         assert!(Config::parse(br#"{"bwrap":"/b","profiles":{"x":{"dbus":{}}}}"#).is_err());
         assert!(Config::parse(br#"{"bwrap":"/b","bogus":1}"#).is_err());
+    }
+
+    #[test]
+    fn sandbox_cannot_reach_full_broker_socket() {
+        let mut c = cfg();
+        c.profiles
+            .get_mut("bot")
+            .unwrap()
+            .unmask
+            .push("/run/secret-broker/broker.sock".into());
+        let e = plan(&c, "bot", &ctx(), &fs()).unwrap_err().to_string();
+        assert!(e.contains("unmask of the full broker socket"), "{e}");
+
+        let mut ctx = ctx();
+        ctx.env
+            .retain(|(k, _)| k != "GROK_HOME");
+        ctx.env.push(("GROK_HOME".into(), "/run".into()));
+        let host = Fake::new(&[
+            ("/home/u/.gnupg", Kind::Dir),
+            ("/home/u/.config/Grok Bot", Kind::Dir),
+            ("/home/u/.netrc", Kind::Other),
+            ("/run/docker.sock", Kind::Other),
+            ("/home/u/dev", Kind::Dir),
+            ("/home/u/.cache", Kind::Dir),
+            ("/home/u/dev/hm/.git/hooks", Kind::Dir),
+            ("/run", Kind::Dir),
+        ]);
+        let e = plan(&cfg(), "bot", &ctx, &host).unwrap_err().to_string();
+        assert!(e.contains("would expose the host"), "{e}");
+
+        let mut c = cfg();
+        c.env.insert(
+            "SECRET_BROKER_SOCKET".into(),
+            "/run/secret-broker/broker.sock".into(),
+        );
+        let e = plan(&c, "default", &ctx, &fs()).unwrap_err().to_string();
+        assert!(e.contains("full broker socket"), "{e}");
     }
 }

@@ -60,6 +60,8 @@ pub struct ProfileInfo {
     pub allow: Vec<Vec<String>>,
     #[serde(default)]
     pub deny: Vec<Vec<String>>,
+    #[serde(default)]
+    pub deny_tokens: Vec<String>,
     /// env vars whose sops key is missing (only when unlocked)
     #[serde(default)]
     pub unresolved: Vec<String>,

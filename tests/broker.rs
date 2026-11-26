@@ -340,6 +340,24 @@ fn states_pin_and_restricted_socket() {
     check_audit(&d);
 }
 
+#[test]
+fn untrusted_prompter_is_refused() {
+    let Some(d) = start(
+        "prompter-exe",
+        serde_json::json!({"prompter_exe": "/nonexistent/secret-broker-dialog"}),
+    ) else {
+        return;
+    };
+    let r = call(&d.main_sock(), &req("prompter"), &[]);
+    assert!(!r.ok, "{}", r.error);
+    assert!(
+        r.error.contains("approval dialog must be") || r.error.contains("/nonexistent"),
+        "{}",
+        r.error
+    );
+    assert!(!status(&d.main_sock()).prompter);
+}
+
 fn check_audit(d: &Daemon) {
     use secret_broker::audit;
     let dir = d.dir.join("audit");

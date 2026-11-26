@@ -10,7 +10,7 @@ you (once per session)       agent (as many times as it likes)
 ──────────────────────       ─────────────────────────────────
 secret-broker unlock         secret-run gh pr list
   └ gpg + pinentry: approve    └ broker checks the allowlist, runs gh as
-                                 user agent-secrets with GH_TOKEN set,
+                                 user sb-gh with GH_TOKEN set,
                                  streams back stdout/stderr/exit code only
 ```
 
@@ -21,8 +21,9 @@ secret-broker unlock         secret-run gh pr list
   `lock`, when the TTL expires, or when the service stops.
 * There is **no operation that returns a secret value**. The socket offers
   `status`, `lock`, `unlock` and `exec <profile>` and nothing else.
-* Commands run as `agent-secrets`, a different uid, so you (and the agent)
-  cannot read `/proc/<pid>/environ` or `/proc/<pid>/mem` or ptrace them.
+* Commands run as a **per-profile** system user `sb-<profile>` (the broker
+  itself is `agent-secrets`), so you, the agent, and other profiles cannot
+  read `/proc/<pid>/environ` or `/proc/<pid>/mem` or ptrace them.
 
 ## Why it's built this way
 
@@ -78,15 +79,18 @@ Profiles are declared in Nix: program (absolute path), fixed args, env var →
 sops key mapping, and allow/deny rules for the caller's arguments:
 
 ```nix
-allow = [ [ "pr" "list" ] [ "pr" "view" "*" ] [ "api" "repos/*" "**" ] ];
+allow = [ [ "pr" "list" ] [ "pr" "view" "*" ] [ "api" "repos/*" ] ];
 deny  = [ [ "auth" "**" ] ];
+denyTokens = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" ];
 ```
 
 Rules are matched position by position. In a token, `*` matches anything and
 `?` matches one character. A whole `**` token matches the rest of the
 arguments. Without `**` the argument count must match exactly. Deny rules are
 checked first. (`**` only works as the last token: a rule that starts
-with `**` matches everything.) The child runs with a clean environment (`PATH` from the
+with `**` matches everything.) `denyTokens` are extra globs checked against
+every argument, any position, so a trailing `**` cannot pass `--hostname` or
+`--debug`. The child runs with a clean environment (`PATH` from the
 profile, `HOME` = `/var/lib/secret-broker/home/<profile>`, `LANG`, the
 secrets), inside the service's systemd sandbox (ProtectHome,
 ProtectSystem=strict, no capabilities, ...). Output is scrubbed for the
@@ -123,17 +127,18 @@ malicious dependency) that wants to read a secret value:
    but `gpg` is a separate process. Run `unlock` yourself, in a terminal the
    agent didn't spawn.
 3. **The allowed program can leak.** `gh auth token`, `gh auth status -t`,
-   `curl -v`, `--debug` flags, writing a config file, `gh alias`/`extension`
-   (arbitrary code)... Allow narrow shapes and deny token-printing ones.
-   Redaction misses transformed output (base64, split strings).
+   `curl -v`, `--debug` flags, `--hostname` (sends `Authorization` to another
+   host), writing a config file, `gh alias`/`extension` (arbitrary code)...
+   Allow narrow shapes (no trailing `**` unless you also set `denyTokens` for
+   those flags). Redaction misses transformed output (base64, split strings).
 4. **Use isn't the same as read.** While unlocked, the agent can do whatever
    the allowed commands can do with the token. Use scoped, short-lived tokens.
 5. **Root beats everything.** If the agent can become root (cached sudo in its
    terminal, permissive polkit rules), no user-level design holds.
-6. **Shared uid between profiles.** All children run as `agent-secrets`. An
-   allowed program that executes arbitrary code could read files under
-   `/var/lib/secret-broker` (no secrets are stored there) but **not** the
-   broker's memory (non-dumpable) or other profiles' secrets.
+6. **Profile uids.** Each profile runs as `sb-<profile>`, not as
+   `agent-secrets`. A child cannot read sibling homes, the PIN file, or the
+   broker's memory (non-dumpable). The broker keeps `CAP_SETUID`/`CAP_SETGID`
+   only to drop to those users before exec.
 7. **Short-lived copies.** Values are kept in mlock'ed, `MADV_DONTDUMP`
    pages that are zeroed before unmapping. Temporary copies (decryption,
    building the child's environment, the redactor) are `Zeroizing` buffers
@@ -167,13 +172,14 @@ services.secret-broker = {
     command = "${pkgs.gh}/bin/gh";
     env.GH_TOKEN = "github.token";
     path = [ pkgs.git pkgs.coreutils ];
-    allow = [ [ "pr" "list" "**" ] [ "pr" "view" "**" ] [ "issue" "list" "**" ] [ "api" "repos/*" ] ];
+    allow = [ [ "pr" "list" ] [ "pr" "view" "*" ] [ "issue" "list" ] [ "api" "repos/*" ] ];
     deny = [ [ "auth" "**" ] [ "alias" "**" ] [ "extension" "**" ] [ "config" "**" ] ];
+    denyTokens = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" "--config" "--config=*" ];
   };
 };
 ```
 
-The child runs as `agent-secrets` with `ProtectHome=true`, so it can't see
+The child runs as `sb-<profile>` with `ProtectHome=true`, so it can't see
 your working directory. Pass data through arguments or stdin
 (`secret-run --stdin p ...`; stdin is forwarded automatically when it isn't a
 terminal). If a profile runs a JIT runtime (node, java), set
@@ -372,15 +378,17 @@ a fake dialog, answer approvals, or change the PIN.
 ### Residual risks of the quick path
 
 * The PIN is typed into a process running as you. Anything unsandboxed as you
-  could draw a fake overlay or register its own prompter (the last registration
-  wins). The phrase you chose at `set-pin` is the tell: no phrase, no PIN.
-  The FIDO2 touch doesn't have this problem (the key signs the broker's challenge).
+  could draw a fake overlay. Only the packaged `secret-broker-dialog` may
+  register as the prompter, and only it is sent the phrase you chose at
+  `set-pin` (no phrase, no PIN). The last registration still wins among
+  copies of that binary. The FIDO2 touch doesn't have this problem (the key
+  signs the broker's challenge).
 * Unsandboxed code as you can also edit the user service / environment of the
   dialog. Keep agents in ai-run.
 * Requester info comes from `/proc` and can be stale if a pid is reused. It's
   advisory, and you can still approve blind.
-* `agent-secrets` children can read the PIN file. It's peppered with the data
-  key, so this is only an offline attack for someone who already has the key.
+* Profile children cannot read the PIN file (different uid, `auth/` is
+  `0700 agent-secrets`). It's still peppered with the data key.
 * Hyprland (optional): `ecosystem:enforce_permissions` with a screencopy deny
   for agents, and `layerrule = noscreenshare, secret-broker`, keep the dialog
   out of screenshots. This isn't enabled; check it against your Hyprland version.
@@ -463,7 +471,7 @@ sandbox under the same uid:
 | `$HOME` | **read-only**; writable: `~/dev`, `~/Documents`, `~/Downloads`, `~/Projects`, `~/Work`, media dirs, `~/.cache`, cargo/npm caches, plus the profile's own state (e.g. `~/.grok`) |
 | credential paths | **masked** (empty tmpfs or `/dev/null`): `~/.gnupg`, `~/.ssh`, `~/.password-store`, keyrings, `gh`/`hub`/copilot, git-credentials, netrc, npm/pypi/cargo/docker/aws/gcloud/kube/rclone credentials, all browser profiles, Proton, Signal and other messengers, **other agents' logins** (`~/.config/Grok Bot`, `~/.grokbot`, `~/.grok`, `~/.claude`...), shell histories, `~/.cache/nix` (fresh, can't be poisoned) |
 | `$XDG_RUNTIME_DIR` | empty tmpfs: no session bus, gpg-agent (so no `secret-broker unlock` from inside), gnome-keyring, Hyprland IPC, `systemd --user`, docker/podman, tmux, terminal IPC sockets |
-| `/run` | system bus, `/run/docker.sock`, `/run/podman`, `/run/libvirt` masked (root-equivalent for your groups); `/run/secret-broker` **reachable**, so `secret-run` works |
+| `/run` | system bus, `/run/docker.sock`, `/run/podman`, `/run/libvirt` masked (root-equivalent for your groups); `/run/secret-broker` is a **tmpfs containing only `agent.sock`**, so `secret-run` works and `broker.sock` cannot appear later |
 | `/tmp` | per profile, not the host's |
 | processes | own pid namespace (can't see or `/proc/<pid>/environ` your other processes), `no_new_privs` (sudo/setuid don't work) |
 | env | `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*_KEY`, `AWS_*`, `GH_*`... removed; `DISPLAY`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` removed |
