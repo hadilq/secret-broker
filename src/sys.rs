@@ -275,18 +275,18 @@ pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Vec<u8>, Vec<RawFd>)
             while !hdr.is_null() {
                 if (*hdr).cmsg_level == libc::SOL_SOCKET && (*hdr).cmsg_type == libc::SCM_RIGHTS {
                     let data = libc::CMSG_DATA(hdr);
-                    let header = usize::try_from(libc::CMSG_LEN(0)).unwrap_or(0);
-                    let bytes = (*hdr).cmsg_len.saturating_sub(header as _);
-                    let count = bytes
-                        .checked_div(std::mem::size_of::<RawFd>())
-                        .unwrap_or(0)
-                        .min(MAX_FDS);
+                    // cmsg_len is size_t on Linux and socklen_t (u32) on Darwin.
+                    let header = libc::CMSG_LEN(0) as u64;
+                    let clen = (*hdr).cmsg_len as u64;
+                    let bytes = usize::try_from(clen.saturating_sub(header)).unwrap_or(0);
+                    let fd_sz = std::mem::size_of::<RawFd>();
+                    let count = bytes.checked_div(fd_sz).unwrap_or(0).min(MAX_FDS);
                     for i in 0..count {
                         let mut fd: RawFd = -1;
                         std::ptr::copy_nonoverlapping(
-                            data.add(i.saturating_mul(std::mem::size_of::<RawFd>())),
+                            data.add(i.saturating_mul(fd_sz)),
                             std::ptr::from_mut(&mut fd).cast(),
-                            std::mem::size_of::<RawFd>(),
+                            fd_sz,
                         );
                         if fd >= 0 {
                             fds.push(fd);
@@ -331,21 +331,39 @@ pub fn chdir(path: &std::ffi::CStr) -> std::io::Result<()> {
 pub fn apply_profile_creds(euid: u32, gid: u32) -> std::io::Result<()> {
     let g = gid;
     let u = euid;
-    // SAFETY: setgroups(0) clears the list; setresgid/setresuid take integer ids.
+    // SAFETY: setgroups(0) clears the list; the uid/gid calls take integer ids.
+    // Linux has setresuid/setresgid; Darwin setuid/setgid as root set all three.
     let r = unsafe {
-        if libc::setgroups(0, std::ptr::null()) != 0
-            || libc::setresgid(g, g, g) != 0
-            || libc::setresuid(u, u, u) != 0
-        {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
             -1
         } else {
-            0
+            apply_ids(u, g)
         }
     };
     if r != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn apply_ids(u: u32, g: u32) -> i32 {
+    // SAFETY: integer ids; caller still has CAP_SETUID/CAP_SETGID.
+    if unsafe { libc::setresgid(g, g, g) != 0 || libc::setresuid(u, u, u) != 0 } {
+        -1
+    } else {
+        0
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn apply_ids(u: u32, g: u32) -> i32 {
+    // SAFETY: integer ids; privileged setgid/setuid set real+effective+saved.
+    if unsafe { libc::setgid(g) != 0 || libc::setuid(u) != 0 } {
+        -1
+    } else {
+        0
+    }
 }
 
 pub fn getpid() -> u32 {
