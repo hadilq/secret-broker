@@ -4,6 +4,7 @@
   rustPlatform,
   gnupg,
   linux-pam,
+  openpam,
   libfido2,
 }:
 let
@@ -31,8 +32,11 @@ rustPlatform.buildRustPackage {
 
   # libpam for the `pam-check` helper (fingerprint & other PAM approval
   # methods run in that separate process, never in the daemon).
-  # On macOS libpam (OpenPAM) comes with the SDK.
-  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ linux-pam ];
+  # Linux-PAM on Linux; OpenPAM on Darwin (the Apple SDK's libpam is not
+  # on rustc's link path in a Nix build).
+  buildInputs = [
+    (if stdenv.hostPlatform.isLinux then linux-pam else openpam)
+  ];
 
   # Absolute gpg/gpgconf/gpg-connect-agent fallback when they are not on PATH.
   env.SECRET_BROKER_GNUPG_BIN = "${gnupg}/bin";

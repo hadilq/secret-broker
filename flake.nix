@@ -57,7 +57,8 @@
           packages =
             with pkgs;
             [ cargo rustc clippy rustfmt rust-analyzer sops gnupg age jq pkg-config libfido2 ]
-            ++ lib.optionals stdenv.hostPlatform.isLinux [ libxkbcommon linux-pam ];
+            ++ lib.optionals stdenv.hostPlatform.isLinux [ libxkbcommon linux-pam ]
+            ++ lib.optionals stdenv.hostPlatform.isDarwin [ openpam ];
         };
       });
 
