@@ -508,10 +508,28 @@ in
     # `secret-broker log` reads the file directly (group read).
     environment.variables.SECRET_BROKER_AUDIT_DIR = lib.mkIf auditCfg.enable auditCfg.directory;
 
-    systemd.tmpfiles.rules = lib.optionals auditCfg.enable [
-      "d ${auditCfg.directory} 2750 agent-secrets ${cfg.group} - -"
-      "z ${auditCfg.directory}/audit.jsonl 0640 agent-secrets ${cfg.group} - -"
-    ];
+    systemd.tmpfiles.rules =
+      [
+        # Traverse-only state dir so sb-* can reach their home, not list siblings
+        # or open auth/. The broker has no CAP_CHOWN; these directories must
+        # already be owned correctly. `z` fixes a leftover 0700 from older units.
+        "d /var/lib/secret-broker 0711 agent-secrets agent-secrets - -"
+        "z /var/lib/secret-broker 0711 agent-secrets agent-secrets - -"
+        "d /var/lib/secret-broker/auth 0700 agent-secrets agent-secrets - -"
+        "z /var/lib/secret-broker/auth 0700 agent-secrets agent-secrets - -"
+        "d /var/lib/secret-broker/home 0711 agent-secrets agent-secrets - -"
+        "z /var/lib/secret-broker/home 0711 agent-secrets agent-secrets - -"
+      ]
+      ++ lib.concatLists (
+        lib.mapAttrsToList (name: _: [
+          "d /var/lib/secret-broker/home/${name} 0700 sb-${name} sb-${name} - -"
+          "z /var/lib/secret-broker/home/${name} 0700 sb-${name} sb-${name} - -"
+        ]) enabledProfiles
+      )
+      ++ lib.optionals auditCfg.enable [
+        "d ${auditCfg.directory} 2750 agent-secrets ${cfg.group} - -"
+        "z ${auditCfg.directory}/audit.jsonl 0640 agent-secrets ${cfg.group} - -"
+      ];
 
     systemd.sockets.secret-broker = {
       description = "secret-broker socket";
@@ -541,7 +559,8 @@ in
         User = "agent-secrets";
         Group = "agent-secrets";
         StateDirectory = "secret-broker";
-        StateDirectoryMode = "0700";
+        # 0711: sb-* can traverse to home/<profile>, not list or read auth/.
+        StateDirectoryMode = "0711";
         UMask = "0077";
         KillMode = "control-group";
         Restart = "on-failure";

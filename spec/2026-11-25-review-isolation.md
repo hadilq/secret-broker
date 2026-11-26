@@ -50,16 +50,17 @@ No `spec/` existed; this file is it.
   `nologin`.
 - `spawn` sets the child's uid/gid to that user before `exec` (`CommandExt`
   on Linux and macOS). The child is also marked non-dumpable.
-- Profile homes are `0700` and owned by `sb-<profile>`. The broker's
-  `state_dir` (`/var/lib/secret-broker`, including `auth/pin`) stays
-  `0700 agent-secrets`, so a profile child cannot read the PIN, sibling
-  homes, or the secrets file path.
+- Profile homes are `0700` and owned by `sb-<profile>`, created by
+  systemd-tmpfiles (the broker has no `CAP_CHOWN`). `/var/lib/secret-broker`
+  and `home/` are `0711 agent-secrets` so a profile uid can traverse to its
+  own home. `auth/` (the PIN) stays `0700 agent-secrets`.
 - Config grows `Profile.user: String` (login name). The NixOS module
   fills it. A missing/unknown user is a start-time error, not a silent
   fall-back to `agent-secrets`.
 - The broker needs `CAP_SETUID` and `CAP_SETGID` in
   `CapabilityBoundingSet` / `AmbientCapabilities` (in addition to the
-  existing `CAP_SYS_PTRACE` for the proc helper). They are used only in
+  existing `CAP_SYS_PTRACE` for the proc helper). Not `CAP_CHOWN`: profile
+  homes are created as the right user by tmpfiles. Caps are used only in
   the child after fork, never to raise privilege. `NoNewPrivileges=true`
   stays. The syscall filter keeps `~ptrace`.
 - Profile names already go through `valid_name`; the user name is

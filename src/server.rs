@@ -33,10 +33,11 @@ use crate::secmem::{self, SecretBuf};
 use crate::sops;
 use crate::sys::{self, PeerCred};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -263,7 +264,19 @@ impl Server {
             allowed
                 .insert(sys::uid_of(name).map_err(|e| e.context(format!("allowed user {name}")))?);
         }
-        let pin_path = Path::new(&cfg.state_dir).join("auth").join("pin");
+        let state_dir = Path::new(&cfg.state_dir);
+        // 0711: profile uids can traverse to their own home, not list or
+        // read auth/. systemd StateDirectoryMode may leave an older 0700
+        // directory unchanged.
+        let _ = std::fs::create_dir_all(state_dir);
+        let _ = sys::chmod(state_dir, 0o711);
+        let homes = state_dir.join("home");
+        let _ = std::fs::create_dir_all(&homes);
+        let _ = sys::chmod(&homes, 0o711);
+        let auth = state_dir.join("auth");
+        let _ = std::fs::create_dir_all(&auth);
+        let _ = sys::chmod(&auth, 0o700);
+        let pin_path = auth.join("pin");
         let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("secret-broker"));
         let audit = Audit::open(cfg.audit.clone());
         Ok(Arc::new(Server {
@@ -1241,12 +1254,6 @@ impl Server {
         if let Err(msg) = crate::policy::check(&p.allow, &p.deny, &p.deny_tokens, &req.args) {
             return deny(stream, msg);
         }
-        let home: PathBuf = Path::new(&self.cfg.state_dir)
-            .join("home")
-            .join(&req.profile);
-        if let Err(e) = std::fs::create_dir_all(&home) {
-            return deny(stream, format!("state dir: {e}"));
-        }
         let ids = if p.user.is_empty() {
             None
         } else {
@@ -1255,16 +1262,10 @@ impl Server {
                 Err(e) => return deny(stream, format!("profile user {}: {e}", p.user)),
             }
         };
-        if let Some((uid, gid)) = ids {
-            let homes = Path::new(&self.cfg.state_dir).join("home");
-            // 0711: profile uids can traverse to their own home, not list siblings.
-            if let Err(e) = sys::chmod(&homes, 0o711)
-                .and_then(|()| sys::chown(&home, uid, gid))
-                .and_then(|()| sys::chmod(&home, 0o700))
-            {
-                return deny(stream, format!("profile home: {e}"));
-            }
-        }
+        let home = match ensure_profile_home(Path::new(&self.cfg.state_dir), &req.profile, ids) {
+            Ok(h) => h,
+            Err(e) => return deny(stream, format!("profile home: {e}")),
+        };
 
         // A sealed session needs a quick approval in the dialog first.
         if let Err(e) = self.ensure_open(req, &args, caller) {
@@ -1476,6 +1477,41 @@ fn lock_writer(w: &Mutex<UnixStream>) -> MutexGuard<'_, UnixStream> {
     w.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Profile homes are created by the NixOS module (tmpfiles) as `sb-<profile>`.
+/// The broker has no CAP_CHOWN, so it only checks the owner; it never chowns.
+fn ensure_profile_home(state_dir: &Path, profile: &str, ids: Option<(u32, u32)>) -> Result<PathBuf> {
+    let homes = state_dir.join("home");
+    std::fs::create_dir_all(&homes).map_err(|e| Error::from(e).context(homes.display()))?;
+    let _ = sys::chmod(&homes, 0o711);
+    let home = homes.join(profile);
+    match ids {
+        None => {
+            std::fs::create_dir_all(&home).map_err(|e| Error::from(e).context(home.display()))?;
+        }
+        Some((uid, gid)) => {
+            let md = std::fs::metadata(&home).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::msg(format!(
+                        "{} is missing; the NixOS module creates it as uid {uid}",
+                        home.display()
+                    ))
+                } else {
+                    Error::from(e).context(home.display())
+                }
+            })?;
+            if md.uid() != uid || md.gid() != gid {
+                bail!(
+                    "{} is owned by uid {} gid {}, expected uid {uid} gid {gid}",
+                    home.display(),
+                    md.uid(),
+                    md.gid()
+                );
+            }
+        }
+    }
+    Ok(home)
+}
+
 fn spawn(
     p: &Profile,
     profile: &str,
@@ -1499,7 +1535,6 @@ fn spawn(
         .env("LANG", "C.UTF-8")
         .env("SECRET_BROKER_PROFILE", profile)
         .envs(&p.extra_env)
-        .current_dir(home)
         .process_group(0)
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -1507,7 +1542,10 @@ fn spawn(
     for (k, v) in values {
         cmd.env(k, OsStr::from_bytes(v));
     }
-    // SAFETY: setuid/setgid then drop caps before exec; no heap allocation.
+    // chdir after setuid: agent-secrets cannot enter a 0700 sb-* home.
+    let home_c = CString::new(home.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "home path contains NUL"))?;
+    // SAFETY: setuid/setgid, chdir, drop caps; no heap allocation.
     unsafe {
         cmd.pre_exec(move || {
             if let Some((uid, gid)) = ids {
@@ -1517,6 +1555,9 @@ fn spawn(
                 if libc::setuid(uid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+            }
+            if libc::chdir(home_c.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
             }
             let _ = sys::set_non_dumpable();
             let _ = sys::drop_all_caps();
