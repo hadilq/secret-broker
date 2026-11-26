@@ -556,6 +556,7 @@ in
       restartTriggers = [ configFile ];
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/secret-broker daemon --config ${configFile}";
+        Environment = "SECRET_BROKER_NONDUMP_SO=${cfg.package}/lib/libsb_nondump.so";
         User = "agent-secrets";
         Group = "agent-secrets";
         StateDirectory = "secret-broker";
@@ -569,14 +570,14 @@ in
         LimitCORE = 0;
         LimitMEMLOCK = "64M";
         NoNewPrivileges = true;
-        # Only for the /proc helper (see callerDetails); the daemon drops it
-        # at start, before it serves anything.
-        # SETUID/SETGID: drop to sb-<profile> before exec. SYS_PTRACE is
-        # dropped in the daemon after the /proc helper is spawned.
+        # Ambient so the proc/exec helpers inherit them; the daemon drops
+        # every capability before it serves (secrets stay in an unprivileged
+        # process). SETUID/SETGID live only in exec-helper.
         CapabilityBoundingSet = lib.concatStringsSep " " (
           [
             "CAP_SETUID"
             "CAP_SETGID"
+            "CAP_KILL"
           ]
           ++ lib.optionals cfg.callerDetails [ "CAP_SYS_PTRACE" ]
         );
@@ -584,6 +585,7 @@ in
           [
             "CAP_SETUID"
             "CAP_SETGID"
+            "CAP_KILL"
           ]
           ++ lib.optionals cfg.callerDetails [ "CAP_SYS_PTRACE" ]
         );
@@ -607,7 +609,7 @@ in
         LockPersonality = true;
         MemoryDenyWriteExecute = cfg.memoryDenyWriteExecute;
         SystemCallArchitectures = "native";
-        SystemCallFilter = [ "@system-service" "~ptrace process_vm_readv process_vm_writev" ];
+        SystemCallFilter = [ "@system-service" "prctl" "~ptrace process_vm_readv process_vm_writev" ];
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
         KeyringMode = "private";
         RemoveIPC = true;

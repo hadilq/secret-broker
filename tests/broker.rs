@@ -140,11 +140,15 @@ fn exec(sock: &Path) -> Result<String, String> {
 }
 
 fn exec_args(sock: &Path, args: &[&str]) -> Result<String, String> {
+    exec_profile(sock, "echo", args)
+}
+
+fn exec_profile(sock: &Path, profile: &str, args: &[&str]) -> Result<String, String> {
     let mut s = send(
         sock,
         &Request {
             op: "exec".into(),
-            profile: "echo".into(),
+            profile: profile.into(),
             args: args.iter().map(|a| a.to_string()).collect(),
             ..Default::default()
         },
@@ -161,7 +165,13 @@ fn exec_args(sock: &Path, args: &[&str]) -> Result<String, String> {
             proto::T_STDOUT => out.extend_from_slice(&p),
             proto::T_EXIT => {
                 let info: proto::ExitInfo = serde_json::from_slice(&p).unwrap();
-                assert_eq!(info.code, 0, "exit info {info:?}");
+                if info.code != 0 {
+                    return Err(if info.error.is_empty() {
+                        format!("exit {}", info.code)
+                    } else {
+                        info.error
+                    });
+                }
                 return Ok(String::from_utf8_lossy(&out).into_owned());
             }
             _ => {}
@@ -356,6 +366,133 @@ fn untrusted_prompter_is_refused() {
         r.error
     );
     assert!(!status(&d.main_sock()).prompter);
+}
+
+#[test]
+fn trusted_prompter_exe_still_gets_the_phrase() {
+    let me = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().into_owned());
+    let Some(me) = me else { return };
+    let Some(d) = start(
+        "prompter-ok",
+        serde_json::json!({"prompter_exe": me}),
+    ) else {
+        return;
+    };
+    let (main, agent) = (d.main_sock(), d.agent_sock());
+    set_pin(&d, b"2468");
+    assert!(call(&main, &req("lock"), &[]).ok);
+    let mut dlg = Dialog::register(&main);
+    assert!(status(&main).prompter);
+    let t = std::thread::spawn(move || exec(&agent));
+    let p = dlg.next();
+    assert_eq!(p.kind, "request");
+    assert_eq!(p.phrase, "blue otter");
+    dlg.pin(p.id, b"2468");
+    assert!(dlg.next().ok);
+    assert_eq!(t.join().unwrap().unwrap(), "ran\n");
+}
+
+#[test]
+fn deny_tokens_refuse_exec_even_with_globstar_allow() {
+    let secrets = format!("{TESTDATA}secrets.sops.json");
+    if secret_broker::config::check_trusted(Path::new(&secrets)).is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("sb-it-deny-tok-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let cfg = serde_json::json!({
+        "secrets_file": secrets,
+        "state_dir": dir.join("state"),
+        "default_ttl_seconds": 600,
+        "profiles": {
+            "gh": {
+                "command": "/bin/echo",
+                "allow": [["pr", "list", "**"]],
+                "deny_tokens": ["--hostname", "--hostname=*", "--debug"]
+            }
+        },
+        "audit": {"directory": dir.join("audit"), "journal": false}
+    });
+    let cfg_path = dir.join("config.json");
+    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_secret-broker"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--socket")
+        .arg(dir.join("broker.sock"))
+        .arg("--agent-socket")
+        .arg(dir.join("agent.sock"))
+        .spawn()
+        .unwrap();
+    let d = Daemon { child, dir };
+    let start = Instant::now();
+    while !d.agent_sock().exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "daemon did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (main, agent) = (d.main_sock(), d.agent_sock());
+    let key = data_key();
+    assert!(call(&main, &req("unlock"), &[(proto::T_KEY, &key)]).ok);
+    let ok = exec_profile(&agent, "gh", &["pr", "list"]);
+    assert!(ok.is_ok(), "{ok:?}");
+    let e = exec_profile(&agent, "gh", &["pr", "list", "--hostname", "evil.com"]).unwrap_err();
+    assert!(e.contains("is denied"), "{e}");
+    let e = exec_profile(&agent, "gh", &["pr", "list", "--debug"]).unwrap_err();
+    assert!(e.contains("is denied"), "{e}");
+}
+
+#[test]
+fn exec_timeout_kills_the_child() {
+    let secrets = format!("{TESTDATA}secrets.sops.json");
+    if secret_broker::config::check_trusted(Path::new(&secrets)).is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("sb-it-timeout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let cfg = serde_json::json!({
+        "secrets_file": secrets,
+        "state_dir": dir.join("state"),
+        "default_ttl_seconds": 600,
+        "profiles": {
+            "nap": {
+                "command": "/bin/sleep",
+                "allow": [["**"]],
+                "timeout_seconds": 1
+            }
+        },
+        "audit": {"directory": dir.join("audit"), "journal": false}
+    });
+    let cfg_path = dir.join("config.json");
+    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_secret-broker"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--socket")
+        .arg(dir.join("broker.sock"))
+        .arg("--agent-socket")
+        .arg(dir.join("agent.sock"))
+        .spawn()
+        .unwrap();
+    let d = Daemon { child, dir };
+    let start = Instant::now();
+    while !d.agent_sock().exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "daemon did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (main, agent) = (d.main_sock(), d.agent_sock());
+    let key = data_key();
+    assert!(call(&main, &req("unlock"), &[(proto::T_KEY, &key)]).ok);
+    let t0 = Instant::now();
+    let e = exec_profile(&agent, "nap", &["30"]).unwrap_err();
+    assert!(t0.elapsed() < Duration::from_secs(8), "{e} {:?}", t0.elapsed());
+    assert!(e.contains("timeout") || e.contains("137") || e.contains("killed"), "{e}");
 }
 
 fn check_audit(d: &Daemon) {

@@ -45,6 +45,10 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     ln -s secret-broker $out/bin/secret-run
+  ''
+  + lib.optionalString stdenv.hostPlatform.isLinux ''
+    mkdir -p $out/lib
+    $CC -shared -fPIC -o $out/lib/libsb_nondump.so ${./nondump.c}
   '';
 
   meta = {

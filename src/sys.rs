@@ -210,9 +210,142 @@ pub fn close_fd(fd: i32) {
     }
 }
 
+const MAX_FDS: usize = 8;
+
+/// Send `payload` and `fds` in one `sendmsg` (SCM_RIGHTS) on an AF_UNIX socket.
+pub fn send_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<()> {
+    if fds.len() > MAX_FDS {
+        bail!("too many fds");
+    }
+    let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(fds.len());
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast::<libc::c_void>().cast_mut(),
+        iov_len: payload.len(),
+    };
+    // SAFETY: CMSG_* macros only do size arithmetic; sendmsg on a socket we own
+    // with iov pointing at `payload` and cbuf holding the SCM_RIGHTS header.
+    let n = unsafe {
+        let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(0);
+        let mut cbuf = vec![0u8; cap.max(1)];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = std::ptr::from_mut(&mut iov);
+        msg.msg_iovlen = 1 as _;
+        if !fds.is_empty() {
+            msg.msg_control = cbuf.as_mut_ptr().cast();
+            msg.msg_controllen = cbuf.len() as _;
+            let hdr = libc::CMSG_FIRSTHDR(&msg);
+            if hdr.is_null() {
+                return Err(Error::msg("sendmsg: CMSG_FIRSTHDR"));
+            }
+            (*hdr).cmsg_level = libc::SOL_SOCKET;
+            (*hdr).cmsg_type = libc::SCM_RIGHTS;
+            (*hdr).cmsg_len = libc::CMSG_LEN(fd_bytes as libc::c_uint) as _;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(hdr).cast(), fds.len());
+        }
+        libc::sendmsg(sock, &msg, 0)
+    };
+    if n < 0 || usize::try_from(n).unwrap_or(0) != payload.len() {
+        return Err(last_os_error("sendmsg"));
+    }
+    Ok(())
+}
+
+/// Receive one `send_fds` message. `max_payload` bounds the JSON body.
+pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Vec<u8>, Vec<RawFd>)> {
+    let mut payload = vec![0u8; max_payload.max(1)];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(MAX_FDS);
+    let mut fds = Vec::new();
+    // SAFETY: recvmsg into `payload`/`cbuf` we own; CMSG_* walk the kernel's
+    // control message; copied fds are new descriptors we take ownership of.
+    let n = unsafe {
+        let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(1);
+        let mut cbuf = vec![0u8; cap.max(1)];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = std::ptr::from_mut(&mut iov);
+        msg.msg_iovlen = 1 as _;
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = cbuf.len() as _;
+        let n = libc::recvmsg(sock, &mut msg, 0);
+        if n >= 0 {
+            let mut hdr = libc::CMSG_FIRSTHDR(&msg);
+            while !hdr.is_null() {
+                if (*hdr).cmsg_level == libc::SOL_SOCKET && (*hdr).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(hdr);
+                    let header = usize::try_from(libc::CMSG_LEN(0)).unwrap_or(0);
+                    let bytes = (*hdr).cmsg_len.saturating_sub(header as _);
+                    let count = bytes
+                        .checked_div(std::mem::size_of::<RawFd>())
+                        .unwrap_or(0)
+                        .min(MAX_FDS);
+                    for i in 0..count {
+                        let mut fd: RawFd = -1;
+                        std::ptr::copy_nonoverlapping(
+                            data.add(i.saturating_mul(std::mem::size_of::<RawFd>())),
+                            std::ptr::from_mut(&mut fd).cast(),
+                            std::mem::size_of::<RawFd>(),
+                        );
+                        if fd >= 0 {
+                            fds.push(fd);
+                        }
+                    }
+                }
+                hdr = libc::CMSG_NXTHDR(&msg, hdr);
+            }
+        }
+        n
+    };
+    if n < 0 {
+        return Err(last_os_error("recvmsg"));
+    }
+    payload.truncate(usize::try_from(n).unwrap_or(0));
+    Ok((payload, fds))
+}
+
 pub fn getuid() -> u32 {
     // SAFETY: getuid never fails.
     unsafe { libc::getuid() }
+}
+
+pub fn getgid() -> u32 {
+    // SAFETY: getgid never fails.
+    unsafe { libc::getgid() }
+}
+
+/// Drop supplementary groups and set real/effective/saved uid and gid.
+/// Interpreters (bash) reset euid to ruid when they differ, so this must be
+/// a full setuid, not a split ruid/euid. The parent then needs CAP_KILL to
+/// signal the child. `set_non_dumpable` before exec is reset by execve;
+/// callers should also `LD_PRELOAD` the constructor .so.
+pub fn chdir(path: &std::ffi::CStr) -> std::io::Result<()> {
+    // SAFETY: path is a valid C string.
+    if unsafe { libc::chdir(path.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn apply_profile_creds(euid: u32, gid: u32) -> std::io::Result<()> {
+    let g = gid;
+    let u = euid;
+    // SAFETY: setgroups(0) clears the list; setresgid/setresuid take integer ids.
+    let r = unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setresgid(g, g, g) != 0
+            || libc::setresuid(u, u, u) != 0
+        {
+            -1
+        } else {
+            0
+        }
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn getpid() -> u32 {
@@ -736,6 +869,7 @@ pub fn drop_caps_keep(keep: u64) -> Result<()> {
     Ok(())
 }
 
+pub const CAP_KILL: u64 = 5;
 pub const CAP_SETGID: u64 = 6;
 pub const CAP_SETUID: u64 = 7;
 pub const CAP_SYS_PTRACE: u64 = 19;
@@ -811,7 +945,7 @@ pub fn local_to_unix(year: i32, month: i32, day: i32, hour: i32, min: i32, sec: 
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     #[test]
     fn peer_cred_of_socketpair_is_us() {
@@ -880,5 +1014,25 @@ mod tests {
             let fl = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             assert!(fl & libc::FD_CLOEXEC != 0);
         }
+    }
+
+    #[test]
+    fn send_recv_fds_roundtrip() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (pr, pw) = pipe().unwrap();
+        send_fds(a.as_raw_fd(), b"hello", &[pw.as_raw_fd()]).unwrap();
+        drop(pw);
+        let (payload, fds) = recv_fds(b.as_raw_fd(), 64).unwrap();
+        assert_eq!(payload, b"hello");
+        let fd = *fds.first().unwrap();
+        // SAFETY: recv_fds transferred ownership of this descriptor.
+        let mut w = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        w.write_all(b"xy").unwrap();
+        drop(w);
+        let mut buf = [0u8; 2];
+        std::fs::File::from(pr).read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"xy");
     }
 }

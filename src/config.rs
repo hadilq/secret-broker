@@ -324,4 +324,20 @@ mod tests {
     fn store_paths_trusted() {
         assert!(check_trusted(Path::new("/nix/store/abc-secrets.json")).is_ok());
     }
+
+    #[test]
+    fn prompter_exe_must_be_absolute() {
+        let dir = std::env::temp_dir().join(format!("sb-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let body = serde_json::json!({
+            "secrets_file": "/nix/store/abc-secrets.json",
+            "approval": {"prompter_exe": "secret-broker-dialog"}
+        });
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        let e = load(path.to_str().unwrap()).unwrap_err().to_string();
+        assert!(e.contains("prompter_exe"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

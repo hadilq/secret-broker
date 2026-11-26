@@ -14,6 +14,7 @@ pub mod caller;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod exechelp;
 pub mod gpgcache;
 pub mod policy;
 pub mod proto;

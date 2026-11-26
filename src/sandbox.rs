@@ -748,10 +748,10 @@ mod tests {
         let e = plan(&c, "bot", &ctx(), &fs()).unwrap_err().to_string();
         assert!(e.contains("unmask of the full broker socket"), "{e}");
 
-        let mut ctx = ctx();
-        ctx.env
+        let mut grok_ctx = ctx();
+        grok_ctx.env
             .retain(|(k, _)| k != "GROK_HOME");
-        ctx.env.push(("GROK_HOME".into(), "/run".into()));
+        grok_ctx.env.push(("GROK_HOME".into(), "/run".into()));
         let host = Fake::new(&[
             ("/home/u/.gnupg", Kind::Dir),
             ("/home/u/.config/Grok Bot", Kind::Dir),
@@ -762,7 +762,7 @@ mod tests {
             ("/home/u/dev/hm/.git/hooks", Kind::Dir),
             ("/run", Kind::Dir),
         ]);
-        let e = plan(&cfg(), "bot", &ctx, &host).unwrap_err().to_string();
+        let e = plan(&cfg(), "bot", &grok_ctx, &host).unwrap_err().to_string();
         assert!(e.contains("would expose the host"), "{e}");
 
         let mut c = cfg();
@@ -770,7 +770,54 @@ mod tests {
             "SECRET_BROKER_SOCKET".into(),
             "/run/secret-broker/broker.sock".into(),
         );
-        let e = plan(&c, "default", &ctx, &fs()).unwrap_err().to_string();
+        let e = plan(&c, "default", &ctx(), &fs()).unwrap_err().to_string();
+        assert!(e.contains("full broker socket"), "{e}");
+
+        let mut c = cfg();
+        c.profiles
+            .get_mut("bot")
+            .unwrap()
+            .unmask
+            .push("/var/run/secret-broker/broker.sock".into());
+        let e = plan(&c, "bot", &ctx(), &fs()).unwrap_err().to_string();
+        assert!(e.contains("unmask of the full broker socket"), "{e}");
+
+        let mut c = cfg();
+        c.writable.push("/etc".into());
+        let host = Fake::new(&[
+            ("/home/u/.gnupg", Kind::Dir),
+            ("/home/u/.config/Grok Bot", Kind::Dir),
+            ("/home/u/.netrc", Kind::Other),
+            ("/run/docker.sock", Kind::Other),
+            ("/home/u/dev", Kind::Dir),
+            ("/home/u/.cache", Kind::Dir),
+            ("/home/u/dev/hm/.git/hooks", Kind::Dir),
+            ("/etc", Kind::Dir),
+        ]);
+        let e = plan(&c, "default", &ctx(), &host).unwrap_err().to_string();
+        assert!(e.contains("would expose the host"), "{e}");
+
+        let mut c = cfg();
+        c.writable.push("/run/secret-broker".into());
+        let host = Fake::new(&[
+            ("/home/u/.gnupg", Kind::Dir),
+            ("/home/u/.config/Grok Bot", Kind::Dir),
+            ("/home/u/.netrc", Kind::Other),
+            ("/run/docker.sock", Kind::Other),
+            ("/home/u/dev", Kind::Dir),
+            ("/home/u/.cache", Kind::Dir),
+            ("/home/u/dev/hm/.git/hooks", Kind::Dir),
+            ("/run/secret-broker", Kind::Dir),
+        ]);
+        let e = plan(&c, "default", &ctx(), &host).unwrap_err().to_string();
+        assert!(e.contains("would expose the host"), "{e}");
+
+        let mut c = cfg();
+        c.profiles.get_mut("default").unwrap().env.insert(
+            "SECRET_BROKER_SOCKET".into(),
+            "/var/run/secret-broker/broker.sock".into(),
+        );
+        let e = plan(&c, "default", &ctx(), &fs()).unwrap_err().to_string();
         assert!(e.contains("full broker socket"), "{e}");
     }
 }

@@ -1,6 +1,7 @@
 //! `secret-broker` / `secret-run` command line.
 
 use secret_broker::{client, config, proto::Status, server, sys, Error, Result};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod pam;
@@ -78,6 +79,10 @@ fn main() -> ExitCode {
         "set-pin" => set_pin_cmd(rest),
         "fido2-enroll" => fido2_enroll_cmd(rest),
         "proc-helper" => match secret_broker::caller::helper_main() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(1, e),
+        },
+        "exec-helper" => match secret_broker::exechelp::helper_main() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(1, e),
         },
@@ -431,24 +436,16 @@ fn daemon(args: &[String]) -> Result<()> {
     }
     let cfg_path = cfg_path.ok_or_else(|| Error::msg("--config is required"))?;
     let cfg = config::load(&cfg_path)?;
-    // The unit may grant CAP_SYS_PTRACE (ambient) for the /proc helper only:
-    // start it first, then drop every capability before any thread exists,
-    // so neither the broker nor the commands it runs keep it. SETUID/SETGID
-    // stay if a profile names a user to exec as.
+    // The unit may grant CAP_SYS_PTRACE (proc helper) and CAP_SETUID/SETGID
+    // (exec helper). Spawn both first, then drop every capability so the
+    // daemon that holds the secrets has none.
     let caps_before = sys::effective_caps().unwrap_or(0);
-    let keep_caps = if cfg.profiles.values().any(|p| !p.user.is_empty()) {
-        (1u64 << sys::CAP_SETUID) | (1u64 << sys::CAP_SETGID)
-    } else {
-        0
-    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("secret-broker"));
     // macOS has no /proc to hide: the broker reads libproc itself.
     let procs = if !cfg!(target_os = "linux") {
         None
     } else {
-        match std::env::current_exe()
-            .map_err(Error::from)
-            .and_then(|exe| secret_broker::caller::Helper::spawn(&exe))
-        {
+        match secret_broker::caller::Helper::spawn(&exe) {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("warning: no /proc helper ({e}); caller details will be partial");
@@ -456,8 +453,17 @@ fn daemon(args: &[String]) -> Result<()> {
             }
         }
     };
-    sys::drop_caps_keep(keep_caps)?;
-    if sys::effective_caps().unwrap_or(0) != keep_caps {
+    let need_exec = cfg.profiles.values().any(|p| !p.user.is_empty());
+    let execs = if need_exec {
+        Some(
+            secret_broker::exechelp::Helper::spawn(&exe)
+                .map_err(|e| e.context("exec-helper"))?,
+        )
+    } else {
+        None
+    };
+    sys::drop_all_caps()?;
+    if sys::effective_caps().unwrap_or(0) != 0 {
         return Err(Error::msg("capabilities still present after dropping them"));
     }
     if let Err(e) = sys::set_non_dumpable() {
@@ -467,7 +473,7 @@ fn daemon(args: &[String]) -> Result<()> {
         eprintln!("warning: {e}");
     }
     let secrets_file = cfg.secrets_file.clone();
-    let srv = server::Server::new(cfg, procs)?;
+    let srv = server::Server::new(cfg, procs, execs)?;
     let (listener, agent) = server::listeners(sock.as_deref(), agent_sock.as_deref())?;
     install_signal_handler(std::sync::Arc::clone(&srv))?;
     eprintln!(

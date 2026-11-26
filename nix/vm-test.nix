@@ -8,6 +8,7 @@ let
       hash)   printf '%s' "$DEMO_TOKEN" | sha256sum | cut -d' ' -f1 ;;
       leak)   echo "token=$DEMO_TOKEN" ;;
       whoami) id -un ;;
+      groups) id -G ;;
       cat)    cat ;;
       sleep)  exec sleep 120 ;;
       *)      exit 3 ;;
@@ -204,12 +205,17 @@ in
         command = "${demoTool}";
         env.DEMO_TOKEN = "demo.token";
         path = [ pkgs.coreutils ];
-        allow = [ [ "hash" ] [ "leak" ] [ "whoami" ] [ "cat" ] [ "sleep" ] ];
+        allow = [ [ "hash" ] [ "leak" ] [ "whoami" ] [ "groups" ] [ "cat" ] [ "sleep" ] ];
         deny = [ [ "env" ] ];
       };
       profiles.other = {
         command = "${pkgs.coreutils}/bin/cat";
         allow = [ [ "*" ] ];
+      };
+      profiles.nap = {
+        command = "${pkgs.coreutils}/bin/sleep";
+        allow = [ [ "*" ] ];
+        timeout = 1;
       };
       approval = {
         # fake-dialog is a Python stand-in; the exe check is covered by unit tests
@@ -286,7 +292,14 @@ in
         out = machine.succeed(h("secret-run demo hash")).strip()
         assert out == hashlib.sha256(SECRET.encode()).hexdigest(), out
         assert machine.succeed(h("secret-run demo whoami")).strip() == "sb-demo"
+        gid = machine.succeed("id -g sb-demo").strip()
+        assert machine.succeed(h("secret-run demo groups")).strip() == gid
         assert machine.succeed(h("echo hi | secret-run demo cat")).strip() == "hi"
+        assert machine.succeed("stat -c %a:%U /var/lib/secret-broker").strip() == "711:agent-secrets"
+        assert machine.succeed("stat -c %a:%U /var/lib/secret-broker/home").strip() == "711:agent-secrets"
+        assert machine.succeed("stat -c %a:%U /var/lib/secret-broker/auth").strip() == "700:agent-secrets"
+        assert machine.succeed("stat -c %a:%U /var/lib/secret-broker/home/demo").strip() == "700:sb-demo"
+        machine.fail(h("ls /var/lib/secret-broker/home"))
         machine.succeed("install -m 600 -o sb-demo -g sb-demo /dev/null /var/lib/secret-broker/home/demo/marker")
         machine.fail(h("secret-run other /var/lib/secret-broker/auth/pin"))
         machine.fail(h("secret-run other /var/lib/secret-broker/home/demo/marker"))
@@ -309,6 +322,9 @@ in
         # sanity: the secret really is in the child's environment (root can see it)
         machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ | grep -q '^DEMO_TOKEN='")
         machine.fail(h(f"cat /proc/{pid}/environ"))
+        # Same uid as the child: dumpable 0 (LD_PRELOAD constructor) must
+        # block /proc/pid/environ even for sb-demo itself.
+        machine.fail(f"su -s ${pkgs.bash}/bin/sh sb-demo -c 'cat /proc/{pid}/environ'")
         machine.fail(h(f"exec 3< /proc/{pid}/mem"))
         machine.succeed(h(f"timeout 5 strace -p {pid} 2>&1 | grep -q 'Operation not permitted'"))
         bpid = machine.succeed("systemctl show -p MainPID --value secret-broker").strip()
@@ -318,13 +334,26 @@ in
         # The broker keeps no capability; only its /proc helper has
         # CAP_SYS_PTRACE (bit 19); commands it runs get none, and don't
         # inherit the listening sockets.
-        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{bpid}/status").strip() == "00000000000000c0"
+        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{bpid}/status").strip() == "0000000000000000"
         hpid = machine.succeed(f"pgrep -P {bpid} -f proc-helper").strip()
         assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{hpid}/status").strip() == "0000000000080000"
+        epid = machine.succeed(f"pgrep -P {bpid} -f exec-helper").strip()
+        assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{epid}/status").strip() == "00000000000000e0"
         assert machine.succeed(f"awk '/^CapEff/{{print $2}}' /proc/{pid}/status").strip() == "0000000000000000"
         fds = machine.succeed(f"ls /proc/{pid}/fd").split()
         assert sorted(fds) == ["0", "1", "2"], fds
         machine.succeed("pkill -u sb-demo -x sleep || true")
+
+    with subtest("timeout and client-gone kill a different-uid child"):
+        t0 = int(machine.succeed("date +%s").strip())
+        out = machine.fail(h("secret-run nap 30 2>&1"))
+        t1 = int(machine.succeed("date +%s").strip())
+        assert t1 - t0 < 8, (t0, t1, out)
+        assert "timeout" in out, out
+        machine.succeed(h("nohup secret-run demo sleep >/tmp/sr-sleep.out 2>&1 & echo $! > /tmp/sr.pid"))
+        machine.wait_until_succeeds("pgrep -u sb-demo -x sleep", timeout=60)
+        machine.succeed(h("kill $(cat /tmp/sr.pid) || true"))
+        machine.wait_until_fails("pgrep -u sb-demo -x sleep", timeout=15)
 
     with subtest("ai-run: credentials masked, home read-only, broker reachable"):
         machine.succeed(h("mkdir -p ~/.config/gh ~/dev ~/.agent-login && chmod 700 ~/.gnupg"))
@@ -353,6 +382,10 @@ in
         out = machine.fail(h("ai-run -- secret-broker unlock --ttl 1m 2>&1"))
         assert "sandbox" in out, out
         machine.fail(h("ai-run -- sh -c 'SECRET_BROKER_SOCKET=/run/secret-broker/broker.sock secret-broker status'"))
+        # tmpfs + /dev/null overlay: the path may exist as a regular file, never a socket
+        machine.succeed(h("ai-run -- test ! -S /run/secret-broker/broker.sock"))
+        machine.succeed(h("ai-run -- test -S /run/secret-broker/agent.sock"))
+        machine.succeed(h("ai-run -- test ! -S /var/run/secret-broker/broker.sock"))
 
     with subtest("ai-run: no session bus by default; proxy only passes allowed names"):
         # su sessions come and go, so use a runtime dir of our own

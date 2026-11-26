@@ -23,6 +23,7 @@ use crate::bail;
 use crate::caller;
 use crate::config::{self, Config, Profile};
 use crate::error::{Error, Result};
+use crate::exechelp;
 use crate::pin;
 use crate::proto::{
     self, Answer, Caller, ExitInfo, Owner, ProfileInfo, Prompt, Request, Requester, Response,
@@ -33,9 +34,9 @@ use crate::secmem::{self, SecretBuf};
 use crate::sops;
 use crate::sys::{self, PeerCred};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -216,6 +217,8 @@ pub struct Server {
     audit: Audit,
     /// Reads /proc for caller details (see caller.rs); None: read directly.
     procs: Mutex<Option<caller::Helper>>,
+    /// Privileged spawn (CAP_SETUID); None when no profile has a `user`.
+    execs: Arc<Mutex<Option<exechelp::Helper>>>,
 }
 
 fn lock_state(m: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -258,7 +261,11 @@ fn ok_response() -> Response {
 }
 
 impl Server {
-    pub fn new(cfg: Config, procs: Option<caller::Helper>) -> Result<Arc<Self>> {
+    pub fn new(
+        cfg: Config,
+        procs: Option<caller::Helper>,
+        execs: Option<exechelp::Helper>,
+    ) -> Result<Arc<Self>> {
         let mut allowed = HashSet::new();
         for name in &cfg.allowed_users {
             allowed
@@ -291,6 +298,7 @@ impl Server {
             helper,
             audit,
             procs: Mutex::new(procs),
+            execs: Arc::new(Mutex::new(execs)),
         }))
     }
 
@@ -1297,11 +1305,20 @@ impl Server {
             }
         }
 
-        let mut child = match spawn(p, &req.profile, &home, &req.args, &values, req.stdin, ids) {
+        let mut child = match spawn(
+            p,
+            &req.profile,
+            &home,
+            &req.args,
+            &values,
+            req.stdin,
+            ids,
+            &self.execs,
+        ) {
             Ok(c) => c,
             Err(e) => return deny(stream, format!("start: {e}")),
         };
-        let pid = child.id();
+        let pid = child.pid;
         let started = Instant::now();
         log(format!(
             "exec by uid {} (pid {}): profile {:?} -> pid {pid}",
@@ -1318,6 +1335,17 @@ impl Server {
 
         let done = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
+        let kill: Arc<dyn Fn(u32) + Send + Sync> = {
+            let execs = Arc::clone(&self.execs);
+            Arc::new(move |pid: u32| {
+                let h = execs.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(h) = h.as_ref() {
+                    let _ = h.kill(pid);
+                } else {
+                    sys::kill_group(pid);
+                }
+            })
+        };
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
         proto::write_json(
             &mut *lock_writer(&writer),
@@ -1332,6 +1360,7 @@ impl Server {
         let mut child_stdin = child.stdin.take();
         if let Ok(mut rd) = reader {
             let done = Arc::clone(&done);
+            let kill = Arc::clone(&kill);
             std::thread::spawn(move || loop {
                 match proto::read_frame(&mut rd) {
                     Ok((proto::T_STDIN, b)) => {
@@ -1345,7 +1374,7 @@ impl Server {
                     Ok(_) => {}
                     Err(_) => {
                         if !done.load(Ordering::SeqCst) {
-                            sys::kill_group(pid);
+                            kill(pid);
                         }
                         return;
                     }
@@ -1357,13 +1386,14 @@ impl Server {
         if p.timeout_seconds > 0 {
             let done = Arc::clone(&done);
             let timed_out = Arc::clone(&timed_out);
+            let kill = Arc::clone(&kill);
             let limit = Duration::from_secs(p.timeout_seconds);
             std::thread::spawn(move || {
                 let start = Instant::now();
                 while !done.load(Ordering::SeqCst) {
                     if start.elapsed() >= limit {
                         timed_out.store(true, Ordering::SeqCst);
-                        sys::kill_group(pid);
+                        kill(pid);
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(200));
@@ -1381,36 +1411,31 @@ impl Server {
             child
                 .stdout
                 .take()
-                .map(|r| (Box::new(r) as Box<dyn Read + Send>, proto::T_STDOUT)),
+                .map(|r| (r, proto::T_STDOUT)),
             child
                 .stderr
                 .take()
-                .map(|r| (Box::new(r) as Box<dyn Read + Send>, proto::T_STDERR)),
+                .map(|r| (r, proto::T_STDERR)),
         ]
         .into_iter()
         .flatten()
         .map(|(r, t)| {
             let writer = Arc::clone(&writer);
             let secrets = redact_vals.clone();
-            std::thread::spawn(move || pump(r, t, &writer, &secrets, pid))
+            let kill = Arc::clone(&kill);
+            std::thread::spawn(move || pump(r, t, &writer, &secrets, pid, &*kill))
         })
         .collect();
         drop(redact_vals);
         for h in pumps {
             let _ = h.join();
         }
-        let status = child.wait();
+        let status = (child.wait)();
         done.store(true, Ordering::SeqCst);
 
         let mut info = ExitInfo::default();
         match status {
-            Ok(s) => {
-                info.code = match (s.code(), s.signal()) {
-                    (Some(c), _) => c,
-                    (None, Some(sig)) => sig.saturating_add(128),
-                    (None, None) => 1,
-                };
-            }
+            Ok(code) => info.code = code,
             Err(e) => {
                 info.code = 1;
                 info.error = e.to_string();
@@ -1512,6 +1537,29 @@ fn ensure_profile_home(state_dir: &Path, profile: &str, ids: Option<(u32, u32)>)
     Ok(home)
 }
 
+fn nondump_so() -> Option<String> {
+    if let Ok(p) = std::env::var("SECRET_BROKER_NONDUMP_SO") {
+        if Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let so = exe.parent()?.join("../lib/libsb_nondump.so");
+    so.is_file()
+        .then(|| so.canonicalize().ok())
+        .flatten()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+struct Spawned {
+    pid: u32,
+    stdin: Option<Box<dyn Write + Send>>,
+    stdout: Option<Box<dyn Read + Send>>,
+    stderr: Option<Box<dyn Read + Send>>,
+    wait: Box<dyn FnOnce() -> std::io::Result<i32> + Send>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     p: &Profile,
     profile: &str,
@@ -1520,53 +1568,166 @@ fn spawn(
     values: &[(String, Zeroizing<Vec<u8>>)],
     stdin: bool,
     ids: Option<(u32, u32)>,
-) -> std::io::Result<std::process::Child> {
+    execs: &Mutex<Option<exechelp::Helper>>,
+) -> std::io::Result<Spawned> {
     let path = if p.path.is_empty() {
         "/run/current-system/sw/bin"
     } else {
         p.path.as_str()
     };
-    let mut cmd = Command::new(&p.command);
-    cmd.args(&p.fixed_args)
-        .args(args)
+    let mut env: Vec<(String, String)> = vec![
+        ("PATH".into(), path.into()),
+        ("HOME".into(), home.to_string_lossy().into_owned()),
+        ("LANG".into(), "C.UTF-8".into()),
+        ("SECRET_BROKER_PROFILE".into(), profile.into()),
+    ];
+    env.extend(p.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    for (k, v) in values {
+        env.push((
+            k.clone(),
+            String::from_utf8_lossy(v.as_ref()).into_owned(),
+        ));
+    }
+    if let Some(so) = nondump_so() {
+        env.push(("LD_PRELOAD".into(), so));
+    }
+    let mut argv = p.fixed_args.clone();
+    argv.extend(args.iter().cloned());
+
+    if let Some((uid, gid)) = ids {
+        return spawn_via_helper(
+            execs,
+            &p.command,
+            &argv,
+            &env,
+            home,
+            uid,
+            gid,
+            stdin,
+        );
+    }
+    spawn_local(&p.command, &argv, &env, home, stdin)
+}
+
+fn spawn_local(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    home: &Path,
+    stdin: bool,
+) -> std::io::Result<Spawned> {
+    let home_c = CString::new(home.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "home path contains NUL"))?;
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .env_clear()
-        .env("PATH", path)
-        .env("HOME", home)
-        .env("LANG", "C.UTF-8")
-        .env("SECRET_BROKER_PROFILE", profile)
-        .envs(&p.extra_env)
+        .envs(env.iter().cloned())
         .process_group(0)
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in values {
-        cmd.env(k, OsStr::from_bytes(v));
-    }
-    // chdir after setuid: agent-secrets cannot enter a 0700 sb-* home.
-    let home_c = CString::new(home.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "home path contains NUL"))?;
-    // SAFETY: setuid/setgid, chdir, drop caps; no heap allocation.
+    // SAFETY: chdir + dumpable; CString lives until spawn returns.
     unsafe {
         cmd.pre_exec(move || {
-            if let Some((uid, gid)) = ids {
-                if libc::setgid(gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setuid(uid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if libc::chdir(home_c.as_ptr()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            sys::chdir(&home_c)?;
             let _ = sys::set_non_dumpable();
             let _ = sys::drop_all_caps();
+            sys::close_from(3);
             Ok(())
         });
     }
-    let child = cmd.spawn();
-    drop(cmd);
-    child
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    Ok(Spawned {
+        pid,
+        stdin: child
+            .stdin
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Write + Send>),
+        stdout: child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        stderr: child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        wait: Box::new(move || {
+            let s = child.wait()?;
+            Ok(match (s.code(), s.signal()) {
+                (Some(c), _) => c,
+                (None, Some(sig)) => sig.saturating_add(128),
+                (None, None) => 1,
+            })
+        }),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_via_helper(
+    execs: &Mutex<Option<exechelp::Helper>>,
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    home: &Path,
+    uid: u32,
+    gid: u32,
+    stdin: bool,
+) -> std::io::Result<Spawned> {
+    let h = execs.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(h) = h.as_ref() else {
+        return Err(std::io::Error::other(
+            "profile user set but exec-helper is not running",
+        ));
+    };
+    let (out_r, out_w) = sys::pipe().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let (err_r, err_w) = sys::pipe().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let (st_r, st_w) = sys::pipe().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let (in_r, in_w) = if stdin {
+        let (r, w) = sys::pipe().map_err(|e| std::io::Error::other(e.to_string()))?;
+        (r, Some(w))
+    } else {
+        let null = std::fs::File::open("/dev/null")?;
+        (OwnedFd::from(null), None)
+    };
+    let req = exechelp::SpawnReq {
+        command: command.into(),
+        args: args.to_vec(),
+        env: env.to_vec(),
+        cwd: home.to_string_lossy().into_owned(),
+        uid,
+        gid,
+    };
+    let pid = h
+        .start(
+            &req,
+            [
+                in_r.as_raw_fd(),
+                out_w.as_raw_fd(),
+                err_w.as_raw_fd(),
+                st_w.as_raw_fd(),
+            ],
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    drop(in_r);
+    drop(out_w);
+    drop(err_w);
+    drop(st_w);
+    Ok(Spawned {
+        pid,
+        stdin: in_w.map(|w| Box::new(std::fs::File::from(w)) as Box<dyn Write + Send>),
+        stdout: Some(Box::new(std::fs::File::from(out_r)) as Box<dyn Read + Send>),
+        stderr: Some(Box::new(std::fs::File::from(err_r)) as Box<dyn Read + Send>),
+        wait: Box::new(move || {
+            let mut f = std::fs::File::from(st_r);
+            let mut buf = String::new();
+            f.read_to_string(&mut buf)?;
+            let v: serde_json::Value = serde_json::from_str(buf.trim())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let n = v.get("code").and_then(serde_json::Value::as_i64).unwrap_or(1);
+            Ok(i32::try_from(n).unwrap_or(1))
+        }),
+    })
 }
 
 fn pump(
@@ -1575,6 +1736,7 @@ fn pump(
     writer: &Mutex<UnixStream>,
     secrets: &[Zeroizing<Vec<u8>>],
     pid: u32,
+    kill: &dyn Fn(u32),
 ) {
     let mut red = if secrets.is_empty() {
         None
@@ -1587,7 +1749,7 @@ fn pump(
             return;
         }
         if proto::write_frame(&mut *lock_writer(writer), t, b).is_err() {
-            sys::kill_group(pid);
+            kill(pid);
         }
     };
     loop {
@@ -1659,4 +1821,65 @@ pub fn listeners(
         None => None,
     };
     Ok((main, agent))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_matches_empty_want_or_exact_or_deleted_suffix() {
+        assert!(Server::exe_matches("/anything", ""));
+        assert!(!Server::exe_matches("", "/bin/sh"));
+        assert!(Server::exe_matches("/bin/sh", "/bin/sh"));
+        assert!(Server::exe_matches("/bin/sh (deleted)", "/bin/sh"));
+        assert!(!Server::exe_matches("/bin/bash", "/bin/sh"));
+        assert!(!Server::exe_matches("/nonexistent-a", "/nonexistent-b"));
+    }
+
+    #[test]
+    fn profile_home_without_user_is_created() {
+        let dir = std::env::temp_dir().join(format!("sb-home-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = ensure_profile_home(&dir, "echo", None).unwrap();
+        assert!(home.is_dir());
+        assert_eq!(home, dir.join("home/echo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_home_missing_when_user_set() {
+        let dir = std::env::temp_dir().join(format!("sb-home-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = ensure_profile_home(&dir, "demo", Some((1, 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is missing"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_home_wrong_owner_is_refused() {
+        let dir = std::env::temp_dir().join(format!("sb-home-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home/demo");
+        std::fs::create_dir_all(&home).unwrap();
+        let md = std::fs::metadata(&home).unwrap();
+        let uid = md.uid();
+        let other = uid.wrapping_add(1).max(1);
+        if other == uid {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let e = ensure_profile_home(&dir, "demo", Some((other, md.gid())))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("owned by"), "{e}");
+        // Matching owner is accepted (tmpfiles already created it).
+        assert!(ensure_profile_home(&dir, "demo", Some((uid, md.gid()))).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

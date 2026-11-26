@@ -179,5 +179,16 @@ mod tests {
                 "{a:?}: {err:?}"
             );
         }
+        // Positional deny still wins; empty deny_tokens does not change allow.
+        assert!(check(&allow, &deny, &[], &v(&["pr", "list", "--debug"])).is_ok());
+        let deny_auth = vec![v(&["auth", "**"])];
+        assert!(check(
+            &allow,
+            &deny_auth,
+            &toks,
+            &v(&["auth", "token"])
+        )
+        .err()
+        .is_some_and(|e| e.contains("deny rule")));
     }
 }
