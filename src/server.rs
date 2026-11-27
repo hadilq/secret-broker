@@ -34,7 +34,7 @@ use crate::secmem::{self, SecretBuf};
 use crate::sops;
 use crate::sys::{self, PeerCred};
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -1575,21 +1575,15 @@ fn spawn(
     } else {
         p.path.as_str()
     };
-    let mut env: Vec<(String, String)> = vec![
+    let mut extra_env: Vec<(String, String)> = vec![
         ("PATH".into(), path.into()),
         ("HOME".into(), home.to_string_lossy().into_owned()),
         ("LANG".into(), "C.UTF-8".into()),
         ("SECRET_BROKER_PROFILE".into(), profile.into()),
     ];
-    env.extend(p.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    for (k, v) in values {
-        env.push((
-            k.clone(),
-            String::from_utf8_lossy(v.as_ref()).into_owned(),
-        ));
-    }
+    extra_env.extend(p.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     if let Some(so) = nondump_so() {
-        env.push(("LD_PRELOAD".into(), so));
+        extra_env.push(("LD_PRELOAD".into(), so));
     }
     let mut argv = p.fixed_args.clone();
     argv.extend(args.iter().cloned());
@@ -1599,20 +1593,22 @@ fn spawn(
             execs,
             &p.command,
             &argv,
-            &env,
+            &extra_env,
+            values,
             home,
             uid,
             gid,
             stdin,
         );
     }
-    spawn_local(&p.command, &argv, &env, home, stdin)
+    spawn_local(&p.command, &argv, &extra_env, values, home, stdin)
 }
 
 fn spawn_local(
     command: &str,
     args: &[String],
-    env: &[(String, String)],
+    extra_env: &[(String, String)],
+    secrets: &[(String, Zeroizing<Vec<u8>>)],
     home: &Path,
     stdin: bool,
 ) -> std::io::Result<Spawned> {
@@ -1621,11 +1617,14 @@ fn spawn_local(
     let mut cmd = Command::new(command);
     cmd.args(args)
         .env_clear()
-        .envs(env.iter().cloned())
+        .envs(extra_env.iter().cloned())
         .process_group(0)
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in secrets {
+        cmd.env(k, OsStr::from_bytes(v));
+    }
     // SAFETY: chdir + dumpable; CString lives until spawn returns.
     unsafe {
         cmd.pre_exec(move || {
@@ -1668,7 +1667,8 @@ fn spawn_via_helper(
     execs: &Mutex<Option<exechelp::Helper>>,
     command: &str,
     args: &[String],
-    env: &[(String, String)],
+    extra_env: &[(String, String)],
+    secrets: &[(String, Zeroizing<Vec<u8>>)],
     home: &Path,
     uid: u32,
     gid: u32,
@@ -1693,7 +1693,7 @@ fn spawn_via_helper(
     let req = exechelp::SpawnReq {
         command: command.into(),
         args: args.to_vec(),
-        env: env.to_vec(),
+        extra_env: extra_env.to_vec(),
         cwd: home.to_string_lossy().into_owned(),
         uid,
         gid,
@@ -1701,6 +1701,7 @@ fn spawn_via_helper(
     let pid = h
         .start(
             &req,
+            secrets,
             [
                 in_r.as_raw_fd(),
                 out_w.as_raw_fd(),

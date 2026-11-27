@@ -453,14 +453,19 @@ fn daemon(args: &[String]) -> Result<()> {
             }
         }
     };
-    let need_exec = cfg.profiles.values().any(|p| !p.user.is_empty());
-    let execs = if need_exec {
+    let mut allowed = Vec::new();
+    for p in cfg.profiles.values() {
+        if !p.user.is_empty() {
+            allowed.push(sys::ids_of(&p.user)?);
+        }
+    }
+    let execs = if allowed.is_empty() {
+        None
+    } else {
         Some(
-            secret_broker::exechelp::Helper::spawn(&exe)
+            secret_broker::exechelp::Helper::spawn(&exe, &allowed)
                 .map_err(|e| e.context("exec-helper"))?,
         )
-    } else {
-        None
     };
     sys::drop_all_caps()?;
     if sys::effective_caps().unwrap_or(0) != 0 {

@@ -212,6 +212,31 @@ pub fn close_fd(fd: i32) {
 
 const MAX_FDS: usize = 8;
 
+/// Connected `SOCK_SEQPACKET` pair: one `sendmsg` is one `recvmsg` (no
+/// coalescing, unlike `UnixStream::pair()` which is `SOCK_STREAM`).
+pub fn seqpacket_pair() -> Result<(std::os::unix::net::UnixStream, std::os::unix::net::UnixStream)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+    let mut fds = [-1, -1];
+    #[cfg(target_os = "linux")]
+    let ty = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let ty = libc::SOCK_SEQPACKET;
+    // SAFETY: fds is a valid 2-int array for socketpair.
+    let r = unsafe { libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last_os_error("socketpair(SEQPACKET)"));
+    }
+    let [a, b] = fds;
+    #[cfg(target_os = "macos")]
+    {
+        set_cloexec(a)?;
+        set_cloexec(b)?;
+    }
+    // SAFETY: socketpair succeeded; we own both descriptors.
+    Ok(unsafe { (UnixStream::from_raw_fd(a), UnixStream::from_raw_fd(b)) })
+}
+
 /// Send `payload` and `fds` in one `sendmsg` (SCM_RIGHTS) on an AF_UNIX socket.
 pub fn send_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<()> {
     if fds.len() > MAX_FDS {
@@ -329,15 +354,22 @@ pub fn chdir(path: &std::ffi::CStr) -> std::io::Result<()> {
 }
 
 pub fn apply_profile_creds(euid: u32, gid: u32) -> std::io::Result<()> {
+    apply_profile_creds_kind(euid, gid, false)
+}
+
+/// `keep_real_uid`: leave ruid as this process (needed so a static binary's
+/// execve stays non-dumpable: ruid != euid). Dynamic binaries and scripts
+/// must use a full setuid (`keep_real_uid = false`) or bash resets euid.
+pub fn apply_profile_creds_kind(euid: u32, gid: u32, keep_real_uid: bool) -> std::io::Result<()> {
     let g = gid;
     let u = euid;
+    let ru = if keep_real_uid { getuid() } else { euid };
     // SAFETY: setgroups(0) clears the list; the uid/gid calls take integer ids.
-    // Linux has setresuid/setresgid; Darwin setuid/setgid as root set all three.
     let r = unsafe {
         if libc::setgroups(0, std::ptr::null()) != 0 {
             -1
         } else {
-            apply_ids(u, g)
+            apply_ids(ru, u, g)
         }
     };
     if r != 0 {
@@ -347,9 +379,9 @@ pub fn apply_profile_creds(euid: u32, gid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn apply_ids(u: u32, g: u32) -> i32 {
+unsafe fn apply_ids(ruid: u32, euid: u32, gid: u32) -> i32 {
     // SAFETY: integer ids; caller still has CAP_SETUID/CAP_SETGID.
-    if unsafe { libc::setresgid(g, g, g) != 0 || libc::setresuid(u, u, u) != 0 } {
+    if unsafe { libc::setresgid(gid, gid, gid) != 0 || libc::setresuid(ruid, euid, euid) != 0 } {
         -1
     } else {
         0
@@ -357,13 +389,18 @@ unsafe fn apply_ids(u: u32, g: u32) -> i32 {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn apply_ids(u: u32, g: u32) -> i32 {
-    // SAFETY: integer ids; privileged setgid/setuid set real+effective+saved.
-    if unsafe { libc::setgid(g) != 0 || libc::setuid(u) != 0 } {
-        -1
-    } else {
-        0
+unsafe fn apply_ids(ruid: u32, euid: u32, gid: u32) -> i32 {
+    // SAFETY: integer ids. Darwin has no setresuid; setuid as root sets all
+    // three, so keep_real_uid uses setreuid.
+    if unsafe { libc::setgid(gid) } != 0 {
+        return -1;
     }
+    let r = if ruid == euid {
+        unsafe { libc::setuid(euid) }
+    } else {
+        unsafe { libc::setreuid(ruid, euid) }
+    };
+    if r != 0 { -1 } else { 0 }
 }
 
 pub fn getpid() -> u32 {
@@ -1037,8 +1074,7 @@ mod tests {
     #[test]
     fn send_recv_fds_roundtrip() {
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = seqpacket_pair().unwrap();
         let (pr, pw) = pipe().unwrap();
         send_fds(a.as_raw_fd(), b"hello", &[pw.as_raw_fd()]).unwrap();
         drop(pw);
@@ -1052,5 +1088,18 @@ mod tests {
         let mut buf = [0u8; 2];
         std::fs::File::from(pr).read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"xy");
+    }
+
+    #[test]
+    fn seqpacket_does_not_coalesce_messages() {
+        let (a, b) = seqpacket_pair().unwrap();
+        send_fds(a.as_raw_fd(), b"one", &[]).unwrap();
+        send_fds(a.as_raw_fd(), b"two", &[]).unwrap();
+        let (p1, f1) = recv_fds(b.as_raw_fd(), 64).unwrap();
+        assert_eq!(p1, b"one");
+        assert!(f1.is_empty());
+        let (p2, f2) = recv_fds(b.as_raw_fd(), 64).unwrap();
+        assert_eq!(p2, b"two");
+        assert!(f2.is_empty());
     }
 }
