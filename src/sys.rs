@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
+use zeroize::Zeroizing;
 
 fn last_os_error(what: &str) -> Error {
     Error::msg(format!("{what}: {}", std::io::Error::last_os_error()))
@@ -182,8 +183,8 @@ pub fn ids_of(name: &str) -> Result<(u32, u32)> {
 }
 
 pub fn chown(path: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::msg("path contains NUL"))?;
+    let c =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::msg("path contains NUL"))?;
     // SAFETY: c is a valid C string for the duration of the call.
     let r = unsafe { libc::chown(c.as_ptr(), uid, gid) };
     if r != 0 {
@@ -193,8 +194,8 @@ pub fn chown(path: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
 }
 
 pub fn chmod(path: &std::path::Path, mode: u32) -> Result<()> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::msg("path contains NUL"))?;
+    let c =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::msg("path contains NUL"))?;
     // SAFETY: c is a valid C string for the duration of the call.
     let r = unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) };
     if r != 0 {
@@ -212,9 +213,72 @@ pub fn close_fd(fd: i32) {
 
 const MAX_FDS: usize = 8;
 
+/// Protocol cap for a helper frame. A `SOCK_SEQPACKET` send still cannot
+/// exceed `SO_SNDBUF` (about 208 KiB by default; we raise it toward this).
+pub const HELPER_MAX_FRAME: usize = 1 << 20;
+
+fn interrupted(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR)
+}
+
+fn set_sock_buf(fd: RawFd, bytes: usize) {
+    let max = usize::try_from(libc::c_int::MAX).unwrap_or(bytes);
+    let v = libc::c_int::try_from(bytes.min(max)).unwrap_or(libc::c_int::MAX);
+    let len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap_or(0);
+    // SAFETY: v is a c_int that lives across both calls.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_ref(&v).cast(),
+            len,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::from_ref(&v).cast(),
+            len,
+        );
+    }
+}
+
+/// Bytes a `SOCK_SEQPACKET` `sendmsg` can carry on `fd` (`SO_SNDBUF` minus
+/// the unix skb overhead the kernel applies).
+pub fn seqpacket_payload_limit(fd: RawFd) -> Result<usize> {
+    let mut v: libc::c_int = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+        .map_err(|_| Error::msg("socklen"))?;
+    // SAFETY: v/len are writable locals of the right size.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_mut(&mut v).cast(),
+            &mut len,
+        )
+    };
+    if r != 0 {
+        return Err(last_os_error("getsockopt(SO_SNDBUF)"));
+    }
+    let n = usize::try_from(v).unwrap_or(0);
+    Ok(n.saturating_sub(32))
+}
+
+pub fn frame_too_large(got: usize, limit: usize) -> Error {
+    Error::msg(format!(
+        "SOCK_SEQPACKET message is {got} bytes; SO_SNDBUF allows {limit} bytes (kernel default is about 208 KiB). Shrink the secret environment or raise net.core.wmem_max"
+    ))
+}
+
 /// Connected `SOCK_SEQPACKET` pair: one `sendmsg` is one `recvmsg` (no
 /// coalescing, unlike `UnixStream::pair()` which is `SOCK_STREAM`).
-pub fn seqpacket_pair() -> Result<(std::os::unix::net::UnixStream, std::os::unix::net::UnixStream)> {
+pub fn seqpacket_pair() -> Result<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
     use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
     let mut fds = [-1, -1];
@@ -233,6 +297,8 @@ pub fn seqpacket_pair() -> Result<(std::os::unix::net::UnixStream, std::os::unix
         set_cloexec(a)?;
         set_cloexec(b)?;
     }
+    set_sock_buf(a, HELPER_MAX_FRAME);
+    set_sock_buf(b, HELPER_MAX_FRAME);
     // SAFETY: socketpair succeeded; we own both descriptors.
     Ok(unsafe { (UnixStream::from_raw_fd(a), UnixStream::from_raw_fd(b)) })
 }
@@ -242,92 +308,175 @@ pub fn send_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<()> {
     if fds.len() > MAX_FDS {
         bail!("too many fds");
     }
-    let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(fds.len());
-    let mut iov = libc::iovec {
-        iov_base: payload.as_ptr().cast::<libc::c_void>().cast_mut(),
-        iov_len: payload.len(),
-    };
-    // SAFETY: CMSG_* macros only do size arithmetic; sendmsg on a socket we own
-    // with iov pointing at `payload` and cbuf holding the SCM_RIGHTS header.
-    let n = unsafe {
-        let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(0);
-        let mut cbuf = vec![0u8; cap.max(1)];
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = std::ptr::from_mut(&mut iov);
-        msg.msg_iovlen = 1 as _;
-        if !fds.is_empty() {
-            msg.msg_control = cbuf.as_mut_ptr().cast();
-            msg.msg_controllen = cbuf.len() as _;
-            let hdr = libc::CMSG_FIRSTHDR(&msg);
-            if hdr.is_null() {
-                return Err(Error::msg("sendmsg: CMSG_FIRSTHDR"));
-            }
-            (*hdr).cmsg_level = libc::SOL_SOCKET;
-            (*hdr).cmsg_type = libc::SCM_RIGHTS;
-            (*hdr).cmsg_len = libc::CMSG_LEN(fd_bytes as libc::c_uint) as _;
-            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(hdr).cast(), fds.len());
+    if let Ok(limit) = seqpacket_payload_limit(sock) {
+        if payload.len() > limit {
+            return Err(frame_too_large(payload.len(), limit));
         }
-        libc::sendmsg(sock, &msg, 0)
-    };
-    if n < 0 || usize::try_from(n).unwrap_or(0) != payload.len() {
-        return Err(last_os_error("sendmsg"));
     }
-    Ok(())
+    let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(fds.len());
+    loop {
+        let mut iov = libc::iovec {
+            iov_base: payload.as_ptr().cast::<libc::c_void>().cast_mut(),
+            iov_len: payload.len(),
+        };
+        // SAFETY: CMSG_* macros only do size arithmetic; sendmsg on a socket we own
+        // with iov pointing at `payload` and cbuf holding the SCM_RIGHTS header.
+        let n = unsafe {
+            let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(0);
+            let mut cbuf = vec![0u8; cap.max(1)];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = std::ptr::from_mut(&mut iov);
+            msg.msg_iovlen = 1 as _;
+            if !fds.is_empty() {
+                msg.msg_control = cbuf.as_mut_ptr().cast();
+                msg.msg_controllen = cbuf.len() as _;
+                let hdr = libc::CMSG_FIRSTHDR(&msg);
+                if hdr.is_null() {
+                    return Err(Error::msg("sendmsg: CMSG_FIRSTHDR"));
+                }
+                (*hdr).cmsg_level = libc::SOL_SOCKET;
+                (*hdr).cmsg_type = libc::SCM_RIGHTS;
+                (*hdr).cmsg_len = libc::CMSG_LEN(fd_bytes as libc::c_uint) as _;
+                std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(hdr).cast(), fds.len());
+            }
+            libc::sendmsg(sock, &msg, 0)
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if interrupted(&err) {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                let limit = seqpacket_payload_limit(sock).unwrap_or(0);
+                return Err(frame_too_large(payload.len(), limit));
+            }
+            return Err(last_os_error("sendmsg"));
+        }
+        if usize::try_from(n).unwrap_or(0) != payload.len() {
+            return Err(last_os_error("sendmsg"));
+        }
+        return Ok(());
+    }
 }
 
-/// Receive one `send_fds` message. `max_payload` bounds the JSON body.
-pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Vec<u8>, Vec<RawFd>)> {
-    let mut payload = vec![0u8; max_payload.max(1)];
-    let mut iov = libc::iovec {
-        iov_base: payload.as_mut_ptr().cast(),
-        iov_len: payload.len(),
+fn poll_in(fd: RawFd) -> Result<libc::c_short> {
+    loop {
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: p is a single pollfd we own.
+        let r = unsafe { libc::poll(&mut p, 1, -1) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if interrupted(&err) {
+                continue;
+            }
+            return Err(last_os_error("poll"));
+        }
+        if r == 0 {
+            continue;
+        }
+        return Ok(p.revents);
+    }
+}
+
+fn fionread(fd: RawFd) -> Option<usize> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: n is a writable c_int.
+    let r = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) };
+    if r != 0 || n < 0 {
+        return None;
+    }
+    usize::try_from(n).ok()
+}
+
+/// Receive one `send_fds` message. `max_payload` is a cap, not the allocation:
+/// we size the (zeroizing) buffer from `FIONREAD` after poll.
+pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Zeroizing<Vec<u8>>, Vec<RawFd>)> {
+    let revents = poll_in(sock)?;
+    let avail = fionread(sock);
+    if avail == Some(0) && (revents & libc::POLLHUP != 0 || revents & libc::POLLIN == 0) {
+        return Err(Error::msg("recvmsg: eof"));
+    }
+    let hint = match avail {
+        Some(0) => 1,
+        Some(n) => n.min(max_payload.max(1)),
+        None => max_payload.max(1),
     };
+    let mut payload = Zeroizing::new(vec![0u8; hint]);
     let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(MAX_FDS);
-    let mut fds = Vec::new();
-    // SAFETY: recvmsg into `payload`/`cbuf` we own; CMSG_* walk the kernel's
-    // control message; copied fds are new descriptors we take ownership of.
-    let n = unsafe {
-        let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(1);
-        let mut cbuf = vec![0u8; cap.max(1)];
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = std::ptr::from_mut(&mut iov);
-        msg.msg_iovlen = 1 as _;
-        msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = cbuf.len() as _;
-        let n = libc::recvmsg(sock, &mut msg, 0);
-        if n >= 0 {
-            let mut hdr = libc::CMSG_FIRSTHDR(&msg);
-            while !hdr.is_null() {
-                if (*hdr).cmsg_level == libc::SOL_SOCKET && (*hdr).cmsg_type == libc::SCM_RIGHTS {
-                    let data = libc::CMSG_DATA(hdr);
-                    // cmsg_len is size_t on Linux and socklen_t (u32) on Darwin.
-                    let header = libc::CMSG_LEN(0) as u64;
-                    let clen = (*hdr).cmsg_len as u64;
-                    let bytes = usize::try_from(clen.saturating_sub(header)).unwrap_or(0);
-                    let fd_sz = std::mem::size_of::<RawFd>();
-                    let count = bytes.checked_div(fd_sz).unwrap_or(0).min(MAX_FDS);
-                    for i in 0..count {
-                        let mut fd: RawFd = -1;
-                        std::ptr::copy_nonoverlapping(
-                            data.add(i.saturating_mul(fd_sz)),
-                            std::ptr::from_mut(&mut fd).cast(),
-                            fd_sz,
-                        );
-                        if fd >= 0 {
-                            fds.push(fd);
+    loop {
+        let mut fds = Vec::new();
+        let flags: libc::c_int;
+        // SAFETY: recvmsg into `payload`/`cbuf` we own; CMSG_* walk the kernel's
+        // control message; copied fds are new descriptors we take ownership of.
+        let n = unsafe {
+            let mut iov = libc::iovec {
+                iov_base: payload.as_mut_ptr().cast(),
+                iov_len: payload.len(),
+            };
+            let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(1);
+            let mut cbuf = vec![0u8; cap.max(1)];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = std::ptr::from_mut(&mut iov);
+            msg.msg_iovlen = 1 as _;
+            msg.msg_control = cbuf.as_mut_ptr().cast();
+            msg.msg_controllen = cbuf.len() as _;
+            let n = libc::recvmsg(sock, &mut msg, 0);
+            flags = msg.msg_flags;
+            if n >= 0 {
+                let mut hdr = libc::CMSG_FIRSTHDR(&msg);
+                while !hdr.is_null() {
+                    if (*hdr).cmsg_level == libc::SOL_SOCKET && (*hdr).cmsg_type == libc::SCM_RIGHTS
+                    {
+                        let data = libc::CMSG_DATA(hdr);
+                        // cmsg_len is size_t on Linux and socklen_t (u32) on Darwin.
+                        let header = libc::CMSG_LEN(0) as u64;
+                        let clen = (*hdr).cmsg_len as u64;
+                        let bytes = usize::try_from(clen.saturating_sub(header)).unwrap_or(0);
+                        let fd_sz = std::mem::size_of::<RawFd>();
+                        let count = bytes.checked_div(fd_sz).unwrap_or(0).min(MAX_FDS);
+                        for i in 0..count {
+                            let mut fd: RawFd = -1;
+                            std::ptr::copy_nonoverlapping(
+                                data.add(i.saturating_mul(fd_sz)),
+                                std::ptr::from_mut(&mut fd).cast(),
+                                fd_sz,
+                            );
+                            if fd >= 0 {
+                                fds.push(fd);
+                            }
                         }
                     }
+                    hdr = libc::CMSG_NXTHDR(&msg, hdr);
                 }
-                hdr = libc::CMSG_NXTHDR(&msg, hdr);
             }
+            n
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if interrupted(&err) {
+                continue;
+            }
+            return Err(last_os_error("recvmsg"));
         }
-        n
-    };
-    if n < 0 {
-        return Err(last_os_error("recvmsg"));
+        if n == 0 {
+            return Err(Error::msg("recvmsg: eof"));
+        }
+        if flags & libc::MSG_TRUNC != 0 {
+            for fd in &fds {
+                close_fd(*fd);
+            }
+            return Err(Error::msg(format!(
+                "SOCK_SEQPACKET message larger than {} bytes; shrink the secret environment",
+                payload.len()
+            )));
+        }
+        payload.truncate(usize::try_from(n).unwrap_or(0));
+        return Ok((payload, fds));
     }
-    payload.truncate(usize::try_from(n).unwrap_or(0));
-    Ok((payload, fds))
 }
 
 pub fn getuid() -> u32 {
@@ -340,11 +489,6 @@ pub fn getgid() -> u32 {
     unsafe { libc::getgid() }
 }
 
-/// Drop supplementary groups and set real/effective/saved uid and gid.
-/// Interpreters (bash) reset euid to ruid when they differ, so this must be
-/// a full setuid, not a split ruid/euid. The parent then needs CAP_KILL to
-/// signal the child. `set_non_dumpable` before exec is reset by execve;
-/// callers should also `LD_PRELOAD` the constructor .so.
 pub fn chdir(path: &std::ffi::CStr) -> std::io::Result<()> {
     // SAFETY: path is a valid C string.
     if unsafe { libc::chdir(path.as_ptr()) } != 0 {
@@ -353,23 +497,22 @@ pub fn chdir(path: &std::ffi::CStr) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn apply_profile_creds(euid: u32, gid: u32) -> std::io::Result<()> {
-    apply_profile_creds_kind(euid, gid, false)
-}
-
-/// `keep_real_uid`: leave ruid as this process (needed so a static binary's
-/// execve stays non-dumpable: ruid != euid). Dynamic binaries and scripts
-/// must use a full setuid (`keep_real_uid = false`) or bash resets euid.
-pub fn apply_profile_creds_kind(euid: u32, gid: u32, keep_real_uid: bool) -> std::io::Result<()> {
-    let g = gid;
-    let u = euid;
-    let ru = if keep_real_uid { getuid() } else { euid };
+/// Drop supplementary groups and set real/effective/saved uid and gid to the
+/// profile user. Always a full setuid (`ruid = euid = suid = uid`): leaving
+/// ruid as the helper (`agent-secrets`) would keep dumpable=0 after exec of a
+/// static binary, but the child could then `seteuid` back to `agent-secrets`.
+/// Interpreters (bash) also reset euid to ruid when they differ.
+///
+/// Static binaries ignore `LD_PRELOAD`, so dumpable is reset by execve; the
+/// remaining boundary is the dedicated `sb-*` uid and `ProtectProc=invisible`.
+/// The parent then needs `CAP_KILL` to signal the child.
+pub fn apply_profile_creds(uid: u32, gid: u32) -> std::io::Result<()> {
     // SAFETY: setgroups(0) clears the list; the uid/gid calls take integer ids.
     let r = unsafe {
         if libc::setgroups(0, std::ptr::null()) != 0 {
             -1
         } else {
-            apply_ids(ru, u, g)
+            apply_ids(uid, gid)
         }
     };
     if r != 0 {
@@ -379,9 +522,9 @@ pub fn apply_profile_creds_kind(euid: u32, gid: u32, keep_real_uid: bool) -> std
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn apply_ids(ruid: u32, euid: u32, gid: u32) -> i32 {
+unsafe fn apply_ids(uid: u32, gid: u32) -> i32 {
     // SAFETY: integer ids; caller still has CAP_SETUID/CAP_SETGID.
-    if unsafe { libc::setresgid(gid, gid, gid) != 0 || libc::setresuid(ruid, euid, euid) != 0 } {
+    if unsafe { libc::setresgid(gid, gid, gid) != 0 || libc::setresuid(uid, uid, uid) != 0 } {
         -1
     } else {
         0
@@ -389,18 +532,74 @@ unsafe fn apply_ids(ruid: u32, euid: u32, gid: u32) -> i32 {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn apply_ids(ruid: u32, euid: u32, gid: u32) -> i32 {
-    // SAFETY: integer ids. Darwin has no setresuid; setuid as root sets all
-    // three, so keep_real_uid uses setreuid.
+unsafe fn apply_ids(uid: u32, gid: u32) -> i32 {
+    // SAFETY: integer ids. Darwin has no setresuid; privileged setuid sets
+    // real, effective, and saved.
     if unsafe { libc::setgid(gid) } != 0 {
         return -1;
     }
-    let r = if ruid == euid {
-        unsafe { libc::setuid(euid) }
+    if unsafe { libc::setuid(uid) } != 0 {
+        -1
     } else {
-        unsafe { libc::setreuid(ruid, euid) }
-    };
-    if r != 0 { -1 } else { 0 }
+        0
+    }
+}
+
+/// NUL-terminated copies of secret env pairs for [`setenv_c`] in `pre_exec`.
+/// Using this instead of `Command::env` avoids extra unwiped copies inside std.
+pub type SecretEnvC = Vec<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>;
+
+pub fn secret_env_c(secrets: &[(String, Zeroizing<Vec<u8>>)]) -> std::io::Result<SecretEnvC> {
+    let mut o = Vec::new();
+    for (k, v) in secrets {
+        o.push((c_env_bytes(k.as_bytes())?, c_env_bytes(v.as_slice())?));
+    }
+    Ok(o)
+}
+
+fn c_env_bytes(bytes: &[u8]) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "environment value contains NUL",
+        ));
+    }
+    let mut v = Zeroizing::new(Vec::new());
+    v.extend_from_slice(bytes);
+    v.push(0);
+    Ok(v)
+}
+
+/// `setenv` from NUL-terminated buffers. Used in `pre_exec` so secret values
+/// never go through `Command::env`.
+pub fn setenv_c(key: &[u8], val: &[u8]) -> std::io::Result<()> {
+    if key.last() != Some(&0) || val.last() != Some(&0) || key.len() <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "setenv: need a non-empty NUL-terminated key and value",
+        ));
+    }
+    // SAFETY: both pointers are NUL-terminated; setenv copies them.
+    let r = unsafe { libc::setenv(key.as_ptr().cast(), val.as_ptr().cast(), 1) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn install_secret_env(pairs: &SecretEnvC) -> std::io::Result<()> {
+    for (k, v) in pairs {
+        setenv_c(k, v)?;
+    }
+    Ok(())
+}
+
+pub fn wipe_secret_env(pairs: &mut SecretEnvC) {
+    use zeroize::Zeroize;
+    for (k, v) in pairs {
+        k.zeroize();
+        v.zeroize();
+    }
 }
 
 pub fn getpid() -> u32 {
@@ -623,6 +822,29 @@ pub fn pid_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 only checks for existence/permission.
     let r = unsafe { libc::kill(pid, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Block until `pid` has exited, but do not reap it (`WNOWAIT`). The pid stays
+/// a zombie so it cannot be reused until a later `waitpid`. Callers remove the
+/// pid from any kill-allow set in between.
+pub fn waitid_exited_nowait(pid: u32) -> std::io::Result<()> {
+    let id = libc::id_t::from(pid);
+    loop {
+        let mut info: libc::siginfo_t = {
+            // SAFETY: siginfo_t is a plain C struct; zeroed is a valid out-value.
+            unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: waitid writes into `info`; WNOWAIT leaves the zombie in place.
+        let r = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if r == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if interrupted(&err) {
+            continue;
+        }
+        return Err(err);
+    }
 }
 
 /// Fill `buf` from the kernel CSPRNG (getrandom(2), blocking until seeded).
@@ -979,7 +1201,14 @@ pub fn utc_time_ms(unix_ms: u64) -> String {
 }
 
 /// Local wall-clock time -> unix seconds (mktime).
-pub fn local_to_unix(year: i32, month: i32, day: i32, hour: i32, min: i32, sec: i32) -> Option<i64> {
+pub fn local_to_unix(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    min: i32,
+    sec: i32,
+) -> Option<i64> {
     let mut tm: libc::tm = {
         // SAFETY: tm is a plain C struct; all-zero is valid.
         unsafe { std::mem::zeroed() }
@@ -1040,11 +1269,17 @@ mod tests {
         let me = i32::try_from(getpid()).unwrap();
         let id = proc_uniqueid(me).unwrap();
         assert_eq!(proc_uniqueid(me), Some(id));
-        let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
         let cpid = i32::try_from(child.id()).unwrap();
         let cid = proc_uniqueid(cpid).unwrap();
         assert_ne!(cid, id);
-        let pin = PeerPin { pid: cpid, uniqueid: cid };
+        let pin = PeerPin {
+            pid: cpid,
+            uniqueid: cid,
+        };
         assert!(pin.alive());
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1079,7 +1314,7 @@ mod tests {
         send_fds(a.as_raw_fd(), b"hello", &[pw.as_raw_fd()]).unwrap();
         drop(pw);
         let (payload, fds) = recv_fds(b.as_raw_fd(), 64).unwrap();
-        assert_eq!(payload, b"hello");
+        assert_eq!(&payload[..], b"hello");
         let fd = *fds.first().unwrap();
         // SAFETY: recv_fds transferred ownership of this descriptor.
         let mut w = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
@@ -1096,10 +1331,126 @@ mod tests {
         send_fds(a.as_raw_fd(), b"one", &[]).unwrap();
         send_fds(a.as_raw_fd(), b"two", &[]).unwrap();
         let (p1, f1) = recv_fds(b.as_raw_fd(), 64).unwrap();
-        assert_eq!(p1, b"one");
+        assert_eq!(&p1[..], b"one");
         assert!(f1.is_empty());
         let (p2, f2) = recv_fds(b.as_raw_fd(), 64).unwrap();
-        assert_eq!(p2, b"two");
+        assert_eq!(&p2[..], b"two");
         assert!(f2.is_empty());
+    }
+
+    #[test]
+    fn send_fds_names_sndbuf_when_message_too_big() {
+        let (a, b) = seqpacket_pair().unwrap();
+        drop(b);
+        let n: libc::c_int = 2048;
+        let len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+        // SAFETY: n is a c_int for SO_SNDBUF.
+        let r = unsafe {
+            libc::setsockopt(
+                a.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::from_ref(&n).cast(),
+                len,
+            )
+        };
+        assert_eq!(r, 0);
+        let payload = vec![0u8; 64 * 1024];
+        let err = send_fds(a.as_raw_fd(), &payload, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SO_SNDBUF"), "{err}");
+        assert!(err.contains("65536"), "{err}");
+        assert!(err.contains("secret environment"), "{err}");
+        let limit = seqpacket_payload_limit(a.as_raw_fd()).unwrap();
+        assert!(err.contains(&limit.to_string()), "{err}");
+    }
+
+    extern "C" fn recv_eintr_nop(_: libc::c_int) {}
+
+    #[test]
+    #[allow(clippy::fn_to_numeric_cast)]
+    fn recv_fds_retries_eintr() {
+        let (a, b) = seqpacket_pair().unwrap();
+        let mut old: libc::sigaction = {
+            // SAFETY: sigaction is a plain C struct; zeroed is a valid out-value.
+            unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: nop handler; we restore `old` before returning.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = recv_eintr_nop as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0; // no SA_RESTART: recvmsg must surface EINTR
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, &mut old), 0);
+        }
+        // SAFETY: pthread_self returns this thread's id.
+        let tid = unsafe { libc::pthread_self() };
+        let killer = std::thread::spawn(move || {
+            for _ in 0..40 {
+                // SAFETY: SIGUSR1 has a no-op handler in this process.
+                unsafe {
+                    libc::pthread_kill(tid, libc::SIGUSR1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_fds(a.as_raw_fd(), b"after-intr", &[]).unwrap();
+        let (p, f) = recv_fds(b.as_raw_fd(), 64).unwrap();
+        assert_eq!(&p[..], b"after-intr");
+        assert!(f.is_empty());
+        let _ = killer.join();
+        // SAFETY: restore the previous handler.
+        unsafe {
+            libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn waitid_nowait_holds_zombie_until_reap() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        waitid_exited_nowait(pid).unwrap();
+        let raw = i32::try_from(pid).unwrap();
+        assert!(pid_alive(raw), "WNOWAIT must keep the pid as a zombie");
+        #[cfg(target_os = "linux")]
+        {
+            let st = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            assert!(
+                st.contains(" Z ") || st.contains(" Z\n"),
+                "expected zombie, got {st}"
+            );
+        }
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_profile_creds_does_not_split_ruid() {
+        let u = getuid();
+        let g = getgid();
+        if apply_profile_creds(u, g).is_err() {
+            return;
+        }
+        let mut r = 0u32;
+        let mut e = 0u32;
+        let mut s = 0u32;
+        // SAFETY: three writable uid_t outs.
+        unsafe {
+            libc::getresuid(&mut r, &mut e, &mut s);
+        }
+        assert_eq!((r, e, s), (u, u, u));
+    }
+
+    #[test]
+    fn secret_env_c_rejects_nul_and_setenv_copies() {
+        let bad = Zeroizing::new(vec![1, 0, 2]);
+        assert!(secret_env_c(&[("A".into(), bad)]).is_err());
+        let ok = Zeroizing::new(b"v".to_vec());
+        let pairs = secret_env_c(&[("SB_TEST_ENV".into(), ok)]).unwrap();
+        install_secret_env(&pairs).unwrap();
+        assert_eq!(std::env::var("SB_TEST_ENV").unwrap(), "v");
+        std::env::remove_var("SB_TEST_ENV");
     }
 }

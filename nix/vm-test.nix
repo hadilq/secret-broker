@@ -14,6 +14,38 @@ let
       *)      exit 3 ;;
     esac
   '';
+  # Static binary used to prove we do a full setuid (ruid=euid=suid=sb-*).
+  # A split ruid=agent-secrets would let this process seteuid back.
+  staticIds = pkgs.stdenv.mkDerivation {
+    name = "sb-static-ids";
+    dontUnpack = true;
+    nativeBuildInputs = [ pkgs.stdenv.cc ];
+    buildInputs = [ pkgs.glibc.static ];
+    buildPhase = ''
+      cat > ids.c <<'EOF'
+      #define _GNU_SOURCE
+      #include <stdio.h>
+      #include <unistd.h>
+      int main(void) {
+        uid_t r, e, s;
+        getresuid(&r, &e, &s);
+        fprintf(stdout, "%u %u %u\n", (unsigned)r, (unsigned)e, (unsigned)s);
+        if (r != e) {
+          if (seteuid(r) == 0) {
+            fprintf(stdout, "escalated %u\n", (unsigned)geteuid());
+            return 10;
+          }
+        }
+        return 0;
+      }
+      EOF
+      $CC -static -O2 -o ids ids.c
+    '';
+    installPhase = ''
+      mkdir -p $out/bin
+      install -m0755 ids $out/bin/ids
+    '';
+  };
   sb = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   dialog = self.packages.${pkgs.stdenv.hostPlatform.system}.secret-broker-dialog;
 
@@ -217,6 +249,10 @@ in
         allow = [ [ "*" ] ];
         timeout = 1;
       };
+      profiles.staticids = {
+        command = "${staticIds}/bin/ids";
+        allow = [ [] ];
+      };
       approval = {
         # fake-dialog is a Python stand-in; the exe check is covered by unit tests
         # and would reject it (`/proc/pid/exe` is the interpreter).
@@ -319,6 +355,9 @@ in
         machine.succeed(h("nohup secret-run demo sleep >/dev/null 2>&1 &"))
         machine.wait_until_succeeds("pgrep -u sb-demo -x sleep", timeout=60)
         pid = machine.succeed("pgrep -u sb-demo -x sleep | head -1").strip()
+        demo_uid = machine.succeed("id -u sb-demo").strip()
+        uids = machine.succeed(f"awk '/^Uid:/{{print $2,$3,$4,$5}}' /proc/{pid}/status").strip().split()
+        assert len(set(uids)) == 1 and uids[0] == demo_uid, (uids, demo_uid)
         # sanity: the secret really is in the child's environment (root can see it)
         machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ | grep -q '^DEMO_TOKEN='")
         machine.fail(h(f"cat /proc/{pid}/environ"))
@@ -343,6 +382,13 @@ in
         fds = machine.succeed(f"ls /proc/{pid}/fd").split()
         assert sorted(fds) == ["0", "1", "2"], fds
         machine.succeed("pkill -u sb-demo -x sleep || true")
+
+    with subtest("static profile binary cannot become agent-secrets"):
+        out = machine.succeed(h("secret-run staticids")).strip()
+        uid = machine.succeed("id -u sb-staticids").strip()
+        assert out == f"{uid} {uid} {uid}", out
+        broker = machine.succeed("id -u agent-secrets").strip()
+        assert uid != broker, (uid, broker)
 
     with subtest("timeout and client-gone kill a different-uid child"):
         t0 = int(machine.succeed("date +%s").strip())

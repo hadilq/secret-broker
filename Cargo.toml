@@ -25,6 +25,9 @@ regex = { version = "1", default-features = false, features = ["std"] }
 # PIN hashing (memory-hard KDF) for quick approval.
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 
+[dev-dependencies]
+zeroize = { version = "1", features = ["alloc"] }
+
 [profile.release]
 # A panic should never happen (see [lints]); if one does anyway (OOM, a bug in
 # a dependency), abort instead of unwinding: no half-dropped state, and core

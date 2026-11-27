@@ -34,7 +34,7 @@ use crate::secmem::{self, SecretBuf};
 use crate::sops;
 use crate::sys::{self, PeerCred};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -343,7 +343,12 @@ impl Server {
         c.uid = cred.uid;
         c.gid = cred.gid;
         c.user = sys::name_of(cred.uid).unwrap_or_default();
-        c.socket = if restricted { "agent.sock" } else { "broker.sock" }.into();
+        c.socket = if restricted {
+            "agent.sock"
+        } else {
+            "broker.sock"
+        }
+        .into();
         c.sandboxed = restricted;
         // The caller's own argv can contain a secret (`secret-run p <value>`):
         // it's shown in the dialog and logged, so redact it like output.
@@ -355,8 +360,9 @@ impl Server {
             Some(pin) => {
                 c.verified = pin.alive();
                 if !c.verified {
-                    c.notes
-                        .push("the caller exited during the snapshot; its pid may be reused".into());
+                    c.notes.push(
+                        "the caller exited during the snapshot; its pid may be reused".into(),
+                    );
                 }
             }
             None => c.notes.push(sys::NO_PEER_PIN.into()),
@@ -399,7 +405,11 @@ impl Server {
         }
         Some(SessionInfo {
             state: mode.as_str().into(),
-            expires_at_unix: if mode == Mode::Open { st.open_until_unix } else { 0 },
+            expires_at_unix: if mode == Mode::Open {
+                st.open_until_unix
+            } else {
+                0
+            },
             unlocked: st.unlocked_by.clone(),
             opened: st.opened_by.clone(),
         })
@@ -714,7 +724,11 @@ impl Server {
     /// `lock`: seal (or forget when no quick method could reopen it).
     fn lock(self: &Arc<Self>, forget: bool, caller: &Caller) {
         let who = format!("uid {} pid {}", caller.uid, caller.pid);
-        let ev = |outcome: &str| Event::new("lock", outcome).caller(caller).field("forget", forget);
+        let ev = |outcome: &str| {
+            Event::new("lock", outcome)
+                .caller(caller)
+                .field("forget", forget)
+        };
         let mut st = lock_state(&self.state);
         if st.secrets.is_none() {
             drop(st);
@@ -783,7 +797,10 @@ impl Server {
                 st.forget();
                 drop(st);
                 log("forgotten (ttl expired)");
-                srv.audit(Event::new("expire", "wiped").field("reason", "ttl, no quick method configured"));
+                srv.audit(
+                    Event::new("expire", "wiped")
+                        .field("reason", "ttl, no quick method configured"),
+                );
             }
         });
         Ok(())
@@ -803,7 +820,10 @@ impl Server {
                 st.forget();
                 drop(st);
                 log("forgotten (sealed too long)");
-                srv.audit(Event::new("expire", "wiped").field("reason", "sealed longer than sealedTimeout"));
+                srv.audit(
+                    Event::new("expire", "wiped")
+                        .field("reason", "sealed longer than sealedTimeout"),
+                );
             }
         });
     }
@@ -870,7 +890,12 @@ impl Server {
 
     /// Set or remove the PIN. Requires the gpg-unwrapped data key, which also
     /// unlocks the session.
-    fn set_pin(self: &Arc<Self>, stream: &mut UnixStream, req: &Request, caller: &Caller) -> Result<()> {
+    fn set_pin(
+        self: &Arc<Self>,
+        stream: &mut UnixStream,
+        req: &Request,
+        caller: &Caller,
+    ) -> Result<()> {
         let pcfg = &self.cfg.approval.pin;
         if !pcfg.enable {
             bail!("PIN approval is disabled in the broker config");
@@ -954,7 +979,12 @@ impl Server {
     }
 
     /// For exec: if sealed, ask the registered dialog for a quick approval.
-    fn ensure_open(self: &Arc<Self>, req: &Request, args: &[String], caller: &Caller) -> Result<()> {
+    fn ensure_open(
+        self: &Arc<Self>,
+        req: &Request,
+        args: &[String],
+        caller: &Caller,
+    ) -> Result<()> {
         match self.mode() {
             Mode::Open => return Ok(()),
             Mode::Cold => bail!(
@@ -991,7 +1021,12 @@ impl Server {
     }
 
     /// `secret-broker unlock` on a sealed session: the terminal is the dialog.
-    fn approve_here(self: &Arc<Self>, stream: &UnixStream, req: &Request, caller: &Caller) -> Result<()> {
+    fn approve_here(
+        self: &Arc<Self>,
+        stream: &UnixStream,
+        req: &Request,
+        caller: &Caller,
+    ) -> Result<()> {
         let _gate = lock_any(&self.gate);
         match self.mode() {
             Mode::Open => return Ok(()),
@@ -999,7 +1034,13 @@ impl Server {
             Mode::Sealed => {}
         }
         let ch = Channel::new(stream, caller.uid, caller.pid)?;
-        let method = self.run_approval(&ch, caller, "secret-broker unlock", req.ttl_seconds, "terminal")?;
+        let method = self.run_approval(
+            &ch,
+            caller,
+            "secret-broker unlock",
+            req.ttl_seconds,
+            "terminal",
+        )?;
         log(format!(
             "session approved via {method} in a terminal by uid {} (pid {})",
             caller.uid, caller.pid
@@ -1039,7 +1080,10 @@ impl Server {
             if let Some(nb) = st.pin_not_before {
                 let now = Instant::now();
                 if now < nb {
-                    let wait = nb.saturating_duration_since(now).as_secs().saturating_add(1);
+                    let wait = nb
+                        .saturating_duration_since(now)
+                        .as_secs()
+                        .saturating_add(1);
                     return PinCheck::Wrong(format!("Too fast: wait {wait}s and try again"));
                 }
             }
@@ -1208,10 +1252,16 @@ impl Server {
         drop(hw);
         let outcome = outcome.and_then(|m| {
             let owner = Owner::from_caller(caller, &m, via, sys::now_unix_i64());
-            self.open(ttl_secs, Some(owner)).map(|()| m).map_err(|e| e.to_string())
+            self.open(ttl_secs, Some(owner))
+                .map(|()| m)
+                .map_err(|e| e.to_string())
         });
         match &outcome {
-            Ok(m) => self.audit(ev("granted").field("method", m.as_str()).field("ttl_seconds", ttl_secs)),
+            Ok(m) => self.audit(
+                ev("granted")
+                    .field("method", m.as_str())
+                    .field("ttl_seconds", ttl_secs),
+            ),
             Err(e) => self.audit(ev(kind).field("reason", e.as_str())),
         }
         let (ok, message) = match &outcome {
@@ -1325,11 +1375,18 @@ impl Server {
             caller.uid, caller.pid, req.profile
         ));
         let exec_ev = |outcome: &str| {
-            Event::new(if outcome == "started" { "exec_start" } else { "exec_end" }, outcome)
-                .caller(caller)
-                .field("profile", req.profile.as_str())
-                .field("args", args.clone())
-                .field("child_pid", pid)
+            Event::new(
+                if outcome == "started" {
+                    "exec_start"
+                } else {
+                    "exec_end"
+                },
+                outcome,
+            )
+            .caller(caller)
+            .field("profile", req.profile.as_str())
+            .field("args", args.clone())
+            .field("child_pid", pid)
         };
         self.audit(exec_ev("started"));
 
@@ -1408,14 +1465,8 @@ impl Server {
         };
         drop(values);
         let pumps: Vec<_> = [
-            child
-                .stdout
-                .take()
-                .map(|r| (r, proto::T_STDOUT)),
-            child
-                .stderr
-                .take()
-                .map(|r| (r, proto::T_STDERR)),
+            child.stdout.take().map(|r| (r, proto::T_STDOUT)),
+            child.stderr.take().map(|r| (r, proto::T_STDERR)),
         ]
         .into_iter()
         .flatten()
@@ -1504,7 +1555,11 @@ fn lock_writer(w: &Mutex<UnixStream>) -> MutexGuard<'_, UnixStream> {
 
 /// Profile homes are created by the NixOS module (tmpfiles) as `sb-<profile>`.
 /// The broker has no CAP_CHOWN, so it only checks the owner; it never chowns.
-fn ensure_profile_home(state_dir: &Path, profile: &str, ids: Option<(u32, u32)>) -> Result<PathBuf> {
+fn ensure_profile_home(
+    state_dir: &Path,
+    profile: &str,
+    ids: Option<(u32, u32)>,
+) -> Result<PathBuf> {
     let homes = state_dir.join("home");
     std::fs::create_dir_all(&homes).map_err(|e| Error::from(e).context(homes.display()))?;
     let _ = sys::chmod(&homes, 0o711);
@@ -1590,15 +1645,7 @@ fn spawn(
 
     if let Some((uid, gid)) = ids {
         return spawn_via_helper(
-            execs,
-            &p.command,
-            &argv,
-            &extra_env,
-            values,
-            home,
-            uid,
-            gid,
-            stdin,
+            execs, &p.command, &argv, &extra_env, values, home, uid, gid, stdin,
         );
     }
     spawn_local(&p.command, &argv, &extra_env, values, home, stdin)
@@ -1612,8 +1659,9 @@ fn spawn_local(
     home: &Path,
     stdin: bool,
 ) -> std::io::Result<Spawned> {
-    let home_c = CString::new(home.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "home path contains NUL"))?;
+    let home_c = CString::new(home.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "home path contains NUL")
+    })?;
     let mut cmd = Command::new(command);
     cmd.args(args)
         .env_clear()
@@ -1622,13 +1670,13 @@ fn spawn_local(
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in secrets {
-        cmd.env(k, OsStr::from_bytes(v));
-    }
-    // SAFETY: chdir + dumpable; CString lives until spawn returns.
+    let mut secret_env = sys::secret_env_c(secrets)?;
+    // SAFETY: chdir + dumpable + setenv; buffers live until spawn returns.
     unsafe {
         cmd.pre_exec(move || {
             sys::chdir(&home_c)?;
+            sys::install_secret_env(&secret_env)?;
+            sys::wipe_secret_env(&mut secret_env);
             let _ = sys::set_non_dumpable();
             let _ = sys::drop_all_caps();
             sys::close_from(3);
@@ -1725,7 +1773,10 @@ fn spawn_via_helper(
             f.read_to_string(&mut buf)?;
             let v: serde_json::Value = serde_json::from_str(buf.trim())
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let n = v.get("code").and_then(serde_json::Value::as_i64).unwrap_or(1);
+            let n = v
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1);
             Ok(i32::try_from(n).unwrap_or(1))
         }),
     })
