@@ -81,7 +81,7 @@ sops key mapping, and allow/deny rules for the caller's arguments:
 ```nix
 allow = [ [ "pr" "list" ] [ "pr" "view" "*" ] [ "api" "repos/*" ] ];
 deny  = [ [ "auth" "**" ] ];
-denyTokens = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" ];
+denyTokens = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" "--jq" "-q" "--quiet" ];
 ```
 
 Rules are matched position by position. In a token, `*` matches anything and
@@ -89,8 +89,10 @@ Rules are matched position by position. In a token, `*` matches anything and
 arguments. Without `**` the argument count must match exactly. Deny rules are
 checked first. (`**` only works as the last token: a rule that starts
 with `**` matches everything.) `denyTokens` are extra globs checked against
-every argument, any position, so a trailing `**` cannot pass `--hostname` or
-`--debug`. The child runs with a clean environment (`PATH` from the
+every argument, any position, and against each letter of a combined short
+flag (`-vq` is both `-v` and `-q`), so a trailing `**` cannot pass
+`--hostname`, `--debug`, `--jq` or `-q`. `allowFlags`, when set, is an
+allowlist of flags. The child runs with a clean environment (`PATH` from the
 profile, `HOME` = `/var/lib/secret-broker/home/<profile>`, `LANG`, the
 secrets), inside the service's systemd sandbox (ProtectHome,
 ProtectSystem=strict, no capabilities, ...). Output is scrubbed for the

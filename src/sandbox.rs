@@ -224,7 +224,9 @@ fn is_forbidden_writable(p: &Path) -> bool {
     if ROOTS.iter().any(|s| p == Path::new(s)) {
         return true;
     }
-    BROKER_DIR.iter().any(|s| p == Path::new(s) || p.starts_with(s))
+    BROKER_DIR
+        .iter()
+        .any(|s| p == Path::new(s) || p.starts_with(s))
 }
 
 fn points_at_broker_sock(v: &str) -> bool {
@@ -265,6 +267,31 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         push(&["--new-session"]);
     }
     let mut p = Plan::default();
+
+    // Hide /run (docker.sock, system bus, pcscd, libvirt, ...). A bind of
+    // /dev/null over those sockets drops when the daemon restarts and creates
+    // a new inode; a tmpfs on /run does not. Re-bind NixOS paths the
+    // sandbox still needs.
+    push(&["--tmpfs", "/run"]);
+    if fs
+        .resolve(Path::new("/var/run"))
+        .is_some_and(|r| r != Path::new("/run"))
+    {
+        push(&["--tmpfs", "/var/run"]);
+    }
+    push(&[
+        "--ro-bind-try",
+        "/run/current-system",
+        "/run/current-system",
+    ]);
+    if prof.gui {
+        push(&["--ro-bind-try", "/run/opengl-driver", "/run/opengl-driver"]);
+        push(&[
+            "--ro-bind-try",
+            "/run/opengl-driver-32",
+            "/run/opengl-driver-32",
+        ]);
+    }
 
     // Hide the full broker socket even if it appears after we start: a tmpfs
     // on the directory, /dev/null over broker.sock, then bind only agent.sock.
@@ -344,7 +371,10 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         let path = expand(home, w)?;
         if let Some(r) = fs.resolve(&path).filter(|r| !in_store(r)) {
             if is_forbidden_writable(&r) {
-                bail!("writable {w:?} resolves to {}, which would expose the host", r.display());
+                bail!(
+                    "writable {w:?} resolves to {}, which would expose the host",
+                    r.display()
+                );
             }
             a.extend(["--bind".into(), s(&r), s(&r)]);
         }
@@ -359,7 +389,10 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
             }
         };
         if is_forbidden_writable(&r) {
-            bail!("writable {w:?} resolves to {}, which would expose the host", r.display());
+            bail!(
+                "writable {w:?} resolves to {}, which would expose the host",
+                r.display()
+            );
         }
         if !in_store(&r) {
             a.extend(["--bind".into(), s(&r), s(&r)]);
@@ -411,6 +444,9 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         }
         let Some(r) = fs.resolve(&path) else { continue };
         if in_store(&r) {
+            continue;
+        }
+        if r.starts_with("/run") || r.starts_with("/var/run") {
             continue;
         }
         match fs.kind(&r) {
@@ -581,8 +617,17 @@ mod tests {
         let p = plan(&cfg(), "default", &ctx(), &fs()).unwrap();
         let a = &p.args;
         assert!(has(a, &["--ro-bind", "/", "/"]));
+        assert!(has(a, &["--tmpfs", "/run"]));
+        assert!(pos(a, &["--tmpfs", "/run"]) > pos(a, &["--ro-bind", "/", "/"]));
         assert!(has(a, &["--tmpfs", "/run/secret-broker"]));
-        assert!(has(a, &["--bind-try", "/run/secret-broker/agent.sock", "/run/secret-broker/agent.sock"]));
+        assert!(has(
+            a,
+            &[
+                "--bind-try",
+                "/run/secret-broker/agent.sock",
+                "/run/secret-broker/agent.sock"
+            ]
+        ));
         assert!(has(
             a,
             &[
@@ -601,7 +646,18 @@ mod tests {
         assert!(has(a, &["--tmpfs", "/home/u/.gnupg"]));
         assert!(has(a, &["--tmpfs", "/home/u/.config/Grok Bot"]));
         assert!(has(a, &["--ro-bind", "/dev/null", "/home/u/.netrc"]));
-        assert!(has(a, &["--ro-bind", "/dev/null", "/run/docker.sock"]));
+        // docker.sock lives under /run: the tmpfs hides it, including a
+        // socket recreated when dockerd restarts. Do not bind the host path.
+        assert!(!has(a, &["--ro-bind", "/dev/null", "/run/docker.sock"]));
+        assert!(!a.iter().any(|x| x == "/run/docker.sock"));
+        assert!(has(
+            a,
+            &[
+                "--ro-bind-try",
+                "/run/current-system",
+                "/run/current-system"
+            ]
+        ));
         assert!(has(a, &["--bind", "/home/u/dev", "/home/u/dev"]));
         assert!(has(
             a,
@@ -649,6 +705,37 @@ mod tests {
     }
 
     #[test]
+    fn run_tmpfs_hides_docker_and_system_bus() {
+        let host = Fake::new(&[
+            ("/home/u/.gnupg", Kind::Dir),
+            ("/home/u/.config/Grok Bot", Kind::Dir),
+            ("/home/u/.netrc", Kind::Other),
+            ("/run/docker.sock", Kind::Other),
+            ("/run/dbus/system_bus_socket", Kind::Other),
+            ("/home/u/dev", Kind::Dir),
+            ("/home/u/.cache", Kind::Dir),
+            ("/home/u/dev/hm/.git/hooks", Kind::Dir),
+            ("/var/run", Kind::Dir),
+            ("/var/run/docker.sock", Kind::Other),
+        ]);
+        let p = plan(&cfg(), "default", &ctx(), &host).unwrap();
+        let a = &p.args;
+        assert!(has(a, &["--tmpfs", "/run"]));
+        assert!(has(a, &["--tmpfs", "/var/run"]));
+        assert!(!a.iter().any(|x| x == "/run/docker.sock"));
+        assert!(!a.iter().any(|x| x == "/run/dbus/system_bus_socket"));
+        assert!(!a.iter().any(|x| x == "/var/run/docker.sock"));
+        assert!(has(
+            a,
+            &[
+                "--bind-try",
+                "/run/secret-broker/agent.sock",
+                "/run/secret-broker/agent.sock"
+            ]
+        ));
+    }
+
+    #[test]
     fn gui_profile_gets_wayland_proxy_and_own_state() {
         let p = plan(&cfg(), "bot", &ctx(), &fs()).unwrap();
         let a = &p.args;
@@ -672,7 +759,12 @@ mod tests {
                 "/run/user/1000/wayland-1"
             ]
         ));
+        assert!(has(a, &["--tmpfs", "/run"]));
         assert!(has(a, &["--dev-bind-try", "/dev/dri", "/dev/dri"]));
+        assert!(has(
+            a,
+            &["--ro-bind-try", "/run/opengl-driver", "/run/opengl-driver"]
+        ));
         assert!(!a.iter().any(|x| x.contains("S.gpg-agent")));
         let (d, sock) = p.proxy.clone().unwrap();
         assert_eq!(
@@ -749,8 +841,7 @@ mod tests {
         assert!(e.contains("unmask of the full broker socket"), "{e}");
 
         let mut grok_ctx = ctx();
-        grok_ctx.env
-            .retain(|(k, _)| k != "GROK_HOME");
+        grok_ctx.env.retain(|(k, _)| k != "GROK_HOME");
         grok_ctx.env.push(("GROK_HOME".into(), "/run".into()));
         let host = Fake::new(&[
             ("/home/u/.gnupg", Kind::Dir),
@@ -762,7 +853,9 @@ mod tests {
             ("/home/u/dev/hm/.git/hooks", Kind::Dir),
             ("/run", Kind::Dir),
         ]);
-        let e = plan(&cfg(), "bot", &grok_ctx, &host).unwrap_err().to_string();
+        let e = plan(&cfg(), "bot", &grok_ctx, &host)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("would expose the host"), "{e}");
 
         let mut c = cfg();

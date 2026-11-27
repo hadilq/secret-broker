@@ -39,6 +39,39 @@ pub struct Hw {
     rx: Receiver<HwEvent>,
 }
 
+/// Hardware (FIDO2, PAM) is armed only once a UI is in front of the user.
+/// The terminal *is* that UI; the graphical dialog must send `ready` first.
+pub fn arm_hardware_now(via: &str, ui_ready: bool) -> bool {
+    via == "terminal" || ui_ready
+}
+
+/// PAM authenticates the session owner (who unlocked), not whoever happens
+/// to be running the dialog.
+pub fn pam_username(
+    session_owner: Option<&str>,
+    allowed_users: &[String],
+    fallback: &str,
+) -> String {
+    if let Some(u) = session_owner {
+        if !u.is_empty() {
+            return u.to_string();
+        }
+    }
+    allowed_users
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+pub fn deny_cooldown_active(
+    denied_at: Option<std::time::Instant>,
+    cooldown: Duration,
+    now: std::time::Instant,
+) -> bool {
+    denied_at.is_some_and(|t| now.saturating_duration_since(t) < cooldown)
+}
+
 impl Default for Hw {
     fn default() -> Self {
         Self::new()
@@ -322,5 +355,47 @@ mod tests {
     #[test]
     fn challenges_differ() {
         assert_ne!(challenge(1, "x").unwrap(), challenge(1, "x").unwrap());
+    }
+
+    #[test]
+    fn dialog_does_not_arm_hardware_before_ui() {
+        assert!(!arm_hardware_now("dialog", false));
+        assert!(arm_hardware_now("dialog", true));
+        assert!(arm_hardware_now("terminal", false));
+        assert!(arm_hardware_now("terminal", true));
+    }
+
+    #[test]
+    fn pam_uses_session_owner_not_approver() {
+        assert_eq!(pam_username(Some("hadi"), &["hadi".into()], "root"), "hadi");
+        assert_eq!(
+            pam_username(Some("hadi"), &["hadi".into()], "dialog-user"),
+            "hadi"
+        );
+        assert_ne!(
+            pam_username(Some("hadi"), &[], "dialog-user"),
+            "dialog-user"
+        );
+        assert_eq!(pam_username(None, &["alice".into()], "bob"), "alice");
+        assert_eq!(pam_username(None, &[], "bob"), "bob");
+    }
+
+    #[test]
+    fn deny_starts_a_cooldown() {
+        let t0 = std::time::Instant::now();
+        let cool = Duration::from_secs(3);
+        assert!(deny_cooldown_active(Some(t0), cool, t0));
+        assert!(deny_cooldown_active(
+            Some(t0),
+            cool,
+            t0 + Duration::from_secs(1)
+        ));
+        assert!(!deny_cooldown_active(
+            Some(t0),
+            cool,
+            t0 + Duration::from_secs(4)
+        ));
+        assert!(!deny_cooldown_active(None, cool, t0));
+        assert!(!deny_cooldown_active(Some(t0), Duration::from_secs(0), t0));
     }
 }

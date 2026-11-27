@@ -61,11 +61,21 @@ let
       denyTokens = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        example = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" ];
+        example = [ "--hostname" "--hostname=*" "--debug" "-v" "--verbose" "--jq" "-q" "--quiet" ];
         description = ''
-          Globs matched against every argument, any position. Use this for
-          flags that print or redirect credentials (`--debug`, `--hostname`)
-          even when an allow rule ends in `**`.
+          Globs matched against every argument, any position, and against each
+          letter of a combined short flag (`-vq` is `-v` and `-q`). Use this
+          for flags that print or redirect credentials even when an allow rule
+          ends in `**`.
+        '';
+      };
+      allowFlags = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "--json" "--limit" "--limit=*" ];
+        description = ''
+          When non-empty, every flag (`-x`, `--foo`) must match one of these
+          globs. Arguments after a bare `--` are not treated as flags.
         '';
       };
       timeout = mkOption {
@@ -157,6 +167,7 @@ let
     profiles = lib.mapAttrs (name: p: {
       inherit (p) description command env allow deny;
       deny_tokens = p.denyTokens;
+      allow_flags = p.allowFlags;
       fixed_args = p.fixedArgs;
       extra_env = p.extraEnv;
       path = lib.makeBinPath p.path;
@@ -165,6 +176,7 @@ let
     }) enabledProfiles;
     approval = {
       timeout_seconds = acfg.timeout;
+      deny_cooldown_seconds = acfg.denyCooldown;
       sealed_max_seconds = acfg.sealedTimeout;
       prompter_exe = if acfg.prompterExe == null then "" else acfg.prompterExe;
       client_exe = if acfg.clientExe == null then "" else acfg.clientExe;
@@ -351,6 +363,11 @@ in
         type = types.ints.positive;
         default = 120;
         description = "Seconds an approval dialog waits before refusing.";
+      };
+      denyCooldown = mkOption {
+        type = types.int;
+        default = 3;
+        description = "Seconds to refuse a new approval after the user hit Deny. 0 = off.";
       };
       prompterExe = mkOption {
         type = types.nullOr types.str;

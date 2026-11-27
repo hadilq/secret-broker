@@ -24,6 +24,8 @@ pub struct Profile {
     pub deny: Vec<Vec<String>>,
     /// Globs matched against every argument, any position (`--hostname`, `--debug`).
     pub deny_tokens: Vec<String>,
+    /// When non-empty, every flag (`-x`, `--foo`) must match one of these globs.
+    pub allow_flags: Vec<String>,
     /// Login the child runs as. Empty: the broker's own uid (tests).
     pub user: String,
     pub timeout_seconds: u64,
@@ -64,6 +66,8 @@ pub struct Approval {
     /// Absolute path of `secret-broker`. When set, terminal approve/unlock
     /// is sent the phrase only if the caller is this binary.
     pub client_exe: String,
+    /// Seconds to refuse a new approval after the user hit Deny. 0 = off.
+    pub deny_cooldown_seconds: u64,
 }
 
 impl Default for Approval {
@@ -76,6 +80,7 @@ impl Default for Approval {
             pam: Vec::new(),
             prompter_exe: String::new(),
             client_exe: String::new(),
+            deny_cooldown_seconds: 3,
         }
     }
 }
@@ -247,10 +252,17 @@ pub fn load(path: &str) -> Result<Config> {
             cred.kind = "es256".into();
         }
         if !matches!(cred.kind.as_str(), "es256" | "rs256" | "eddsa") {
-            bail!("fido2 credential {}: unknown type {:?}", cred.name, cred.kind);
+            bail!(
+                "fido2 credential {}: unknown type {:?}",
+                cred.name,
+                cred.kind
+            );
         }
         if cred.id.is_empty() || !cred.public_key_file.starts_with('/') {
-            bail!("fido2 credential {}: needs id and an absolute public_key_file", cred.name);
+            bail!(
+                "fido2 credential {}: needs id and an absolute public_key_file",
+                cred.name
+            );
         }
     }
     for m in &mut a.pam {

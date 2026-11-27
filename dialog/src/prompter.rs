@@ -10,7 +10,15 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 fn send(s: &mut UnixStream, kind: &str, id: u64) -> Result<(), String> {
-    proto::write_json(s, proto::T_JSON, &Answer { kind: kind.into(), id }).map_err(|e| e.to_string())
+    proto::write_json(
+        s,
+        proto::T_JSON,
+        &Answer {
+            kind: kind.into(),
+            id,
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn human(secs: u64) -> String {
@@ -60,8 +68,16 @@ fn owner_detail(o: &Owner) -> String {
         o.uid,
         o.pid,
         o.command,
-        if o.app.is_empty() { String::new() } else { format!(" — {}", o.app) },
-        if o.socket.is_empty() { String::new() } else { format!(" — {}", o.socket) },
+        if o.app.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", o.app)
+        },
+        if o.socket.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", o.socket)
+        },
     )
 }
 
@@ -73,13 +89,20 @@ pub fn details_for(c: &Caller, session: Option<&SessionInfo>) -> Vec<(String, St
             d.push((l.to_string(), v, t));
         }
     };
-    add("User", format!("{} (uid {}, gid {})", c.user, c.uid, c.gid), Tone::Normal);
+    add(
+        "User",
+        format!("{} (uid {}, gid {})", c.user, c.uid, c.gid),
+        Tone::Normal,
+    );
     add(
         "PID",
         if c.verified {
             format!("{} (pinned by pidfd: still the same process)", c.pid)
         } else {
-            format!("{} (not verified: it may have exited and the pid been reused)", c.pid)
+            format!(
+                "{} (not verified: it may have exited and the pid been reused)",
+                c.pid
+            )
         },
         if c.verified { Tone::Normal } else { Tone::Warn },
     );
@@ -93,7 +116,11 @@ pub fn details_for(c: &Caller, session: Option<&SessionInfo>) -> Vec<(String, St
         } else {
             format!("{} (full access)", c.socket)
         },
-        if c.sandboxed { Tone::Warn } else { Tone::Normal },
+        if c.sandboxed {
+            Tone::Warn
+        } else {
+            Tone::Normal
+        },
     );
     add("ai-run", c.ai_run_profile.clone(), Tone::Warn);
     add("App", c.app_label(), Tone::Normal);
@@ -161,7 +188,11 @@ pub fn view_for(p: &Prompt) -> View {
         if !c.verified {
             who.push_str("  (unverified)");
         }
-        rows.push(("Requested by".to_string(), who, if c.verified { Tone::Normal } else { Tone::Warn }));
+        rows.push((
+            "Requested by".to_string(),
+            who,
+            if c.verified { Tone::Normal } else { Tone::Warn },
+        ));
         let app = c.app_label();
         if !app.is_empty() {
             rows.push(("App".to_string(), app, Tone::Normal));
@@ -188,15 +219,27 @@ pub fn view_for(p: &Prompt) -> View {
     } else if let Some(r) = &p.requester {
         // Older broker: read /proc ourselves.
         let who = procinfo::cmdline(r.pid).unwrap_or_else(|| "(process gone)".into());
-        rows.push(("Requested by".to_string(), format!("{who}  [pid {}]", r.pid), Tone::Normal));
+        rows.push((
+            "Requested by".to_string(),
+            format!("{who}  [pid {}]", r.pid),
+            Tone::Normal,
+        ));
         let chain = procinfo::chain(r.pid, 6);
         if !chain.is_empty() {
             rows.push(("Parents".to_string(), chain, Tone::Muted));
         }
         if r.sandboxed {
-            rows.push(("Context".to_string(), format!("inside an ai-run sandbox ({})", r.user), Tone::Warn));
+            rows.push((
+                "Context".to_string(),
+                format!("inside an ai-run sandbox ({})", r.user),
+                Tone::Warn,
+            ));
         } else {
-            rows.push(("Context".to_string(), format!("outside any sandbox ({})", r.user), Tone::Normal));
+            rows.push((
+                "Context".to_string(),
+                format!("outside any sandbox ({})", r.user),
+                Tone::Normal,
+            ));
         }
     }
     if !p.purpose.is_empty() {
@@ -207,7 +250,11 @@ pub fn view_for(p: &Prompt) -> View {
         rows.push(("Unlocked".to_string(), owner_line(o), Tone::Muted));
     }
     let pin = p.methods.iter().any(|m| m == "pin");
-    let tab = if details.is_empty() { "" } else { "Tab  details      " };
+    let tab = if details.is_empty() {
+        ""
+    } else {
+        "Tab  details      "
+    };
     View {
         title: "Approve secret session".into(),
         rows,
@@ -247,6 +294,7 @@ fn handle(opts: &Opts, s: &mut UnixStream, p: &Prompt) -> Result<(), String> {
         }
     };
     ui.set_view(view_for(p));
+    send(s, "ready", p.id)?;
     let fd = s.as_raw_fd();
     let mut closing: Option<Instant> = None;
     loop {
@@ -282,11 +330,12 @@ fn handle(opts: &Opts, s: &mut UnixStream, p: &Prompt) -> Result<(), String> {
                     "update" => {
                         let v = ui.view_mut();
                         v.busy = false;
-                        let tone = if m.message.starts_with("Wrong") || m.message.contains("giving up") {
-                            Tone::Error
-                        } else {
-                            Tone::Warn
-                        };
+                        let tone =
+                            if m.message.starts_with("Wrong") || m.message.contains("giving up") {
+                                Tone::Error
+                            } else {
+                                Tone::Warn
+                            };
                         v.message = Some((m.message, tone));
                     }
                     "done" => {
@@ -311,7 +360,7 @@ fn handle(opts: &Opts, s: &mut UnixStream, p: &Prompt) -> Result<(), String> {
 
 fn session(opts: &Opts) -> Result<(), String> {
     let path = secret_broker::client::socket_path();
-    let mut s = UnixStream::connect(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut s = secret_broker::client::connect_broker().map_err(|e| e.to_string())?;
     proto::write_json(
         &mut s,
         proto::T_JSON,
@@ -327,7 +376,8 @@ fn session(opts: &Opts) -> Result<(), String> {
     }
     eprintln!("secret-broker-dialog: connected to {path}");
     loop {
-        let p: Prompt = proto::read_json(&mut s, proto::T_JSON).map_err(|e| format!("broker connection: {e}"))?;
+        let p: Prompt = proto::read_json(&mut s, proto::T_JSON)
+            .map_err(|e| format!("broker connection: {e}"))?;
         if p.kind == "request" {
             if let Err(e) = handle(opts, &mut s, &p) {
                 eprintln!("secret-broker-dialog: {e}");

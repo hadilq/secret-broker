@@ -28,13 +28,53 @@ pub fn socket_path() -> String {
         .unwrap_or_else(|| DEFAULT_SOCKET.into())
 }
 
-fn dial() -> Result<UnixStream> {
+fn connect_raw() -> Result<UnixStream> {
     let p = socket_path();
     UnixStream::connect(&p).map_err(|e| {
         Error::msg(format!(
             "cannot reach broker at {p}: {e} (is services.secret-broker enabled, and are you in its group? log out/in after adding)"
         ))
     })
+}
+
+/// Connect and refuse a socket that is not the real daemon. Call this
+/// before sending the gpg data key or a PIN. A user-owned
+/// `SECRET_BROKER_SOCKET` outside `/run/secret-broker` can steal those.
+pub fn connect_broker() -> Result<UnixStream> {
+    let p = socket_path();
+    let s = connect_raw()?;
+    verify_broker_peer(&p, &s)?;
+    Ok(s)
+}
+
+fn is_system_broker_socket(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    p.starts_with("/run/secret-broker") || p.starts_with("/var/run/secret-broker")
+}
+
+pub fn verify_broker_peer(path: &str, sock: &UnixStream) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let p = std::path::Path::new(path);
+    crate::config::check_trusted(p).map_err(|e| e.context("untrusted SECRET_BROKER_SOCKET"))?;
+    let cred = crate::sys::peer_cred(sock.as_raw_fd())?;
+    let md = std::fs::metadata(p).map_err(|e| Error::from(e).context(path))?;
+    if cred.uid != md.uid() {
+        bail!(
+            "SECRET_BROKER_SOCKET {path}: peer uid {} does not match socket owner {}",
+            cred.uid,
+            md.uid()
+        );
+    }
+    if !is_system_broker_socket(path)
+        && cred.uid == crate::sys::getuid()
+        && crate::sys::getuid() != 0
+    {
+        bail!(
+            "refusing SECRET_BROKER_SOCKET={path}: a user-owned socket outside /run/secret-broker can steal the data key or PIN"
+        );
+    }
+    Ok(())
 }
 
 fn round_trip(req: &Request, key: Option<&[u8]>) -> Result<Response> {
@@ -45,7 +85,11 @@ fn round_trip(req: &Request, key: Option<&[u8]>) -> Result<Response> {
 }
 
 fn round_trip_frames(req: &Request, frames: &[(u8, &[u8])]) -> Result<Response> {
-    let mut s = dial()?;
+    let mut s = if frames.iter().any(|(t, _)| *t == proto::T_KEY) {
+        connect_broker()?
+    } else {
+        connect_raw()?
+    };
     proto::write_json(&mut s, proto::T_JSON, req)?;
     for (t, b) in frames {
         proto::write_frame(&mut s, *t, b)?;
@@ -333,7 +377,7 @@ impl Input {
 
 /// Approve a sealed session from this terminal (PIN and/or hardware).
 pub fn approve_tty(ttl_seconds: Option<u64>) -> Result<Status> {
-    let mut s = dial()?;
+    let mut s = connect_broker()?;
     proto::write_json(
         &mut s,
         proto::T_JSON,
@@ -492,7 +536,10 @@ pub fn fido2_enroll(device: Option<&str>, name: &str, rp: &str) -> Result<String
             match devs.as_slice() {
                 [] => bail!("no FIDO2 security key found (plug one in; check `fido2-token -L`)"),
                 [d] => d.clone(),
-                _ => bail!("several keys found ({}); pick one with --device", devs.join(", ")),
+                _ => bail!(
+                    "several keys found ({}); pick one with --device",
+                    devs.join(", ")
+                ),
             }
         }
     };
@@ -501,14 +548,13 @@ pub fn fido2_enroll(device: Option<&str>, name: &str, rp: &str) -> Result<String
     crate::sys::random(&mut cdh)?;
     crate::sys::random(&mut uid)?;
     let user = crate::sys::name_of(crate::sys::getuid()).unwrap_or_else(|_| "user".into());
-    let input = format!(
-        "{}\n{rp}\n{user}\n{}\n",
-        B64.encode(cdh),
-        B64.encode(uid)
-    );
+    let input = format!("{}\n{rp}\n{user}\n{}\n", B64.encode(cdh), B64.encode(uid));
     eprintln!("Touch your security key ({dev}) to create the secret-broker credential...");
     let make = pipe_through(
-        Command::new(fido2_tool("fido2-cred")).arg("-M").arg(&dev).arg("es256"),
+        Command::new(fido2_tool("fido2-cred"))
+            .arg("-M")
+            .arg(&dev)
+            .arg("es256"),
         input.as_bytes(),
     )?;
     let verified = pipe_through(
@@ -529,7 +575,12 @@ pub fn fido2_enroll(device: Option<&str>, name: &str, rp: &str) -> Result<String
     }
     if let Err(e) = report(
         "fido2_enroll",
-        &[("name", name), ("rp", rp), ("credential_id", &id), ("device", &dev)],
+        &[
+            ("name", name),
+            ("rp", rp),
+            ("credential_id", &id),
+            ("device", &dev),
+        ],
     ) {
         eprintln!("note: could not record the enrollment in the audit log: {e}");
     }
@@ -575,7 +626,7 @@ fn pipe_through(cmd: &mut Command, input: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn run(profile: &str, args: &[String], force_stdin: bool, no_stdin: bool) -> Result<i32> {
-    let mut s = dial()?;
+    let mut s = connect_raw()?;
     let fwd = !no_stdin && (force_stdin || !crate::sys::isatty(0));
     let req = Request {
         op: "exec".into(),
@@ -631,5 +682,52 @@ pub fn run(profile: &str, args: &[String], force_stdin: bool, no_stdin: bool) ->
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+
+    fn temp_sock() -> (PathBuf, UnixListener) {
+        let dir = std::env::temp_dir().join(format!(
+            "sb-sock-{}-{}",
+            std::process::id(),
+            crate::sys::now_unix_i64()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("evil.sock");
+        let lis = UnixListener::bind(&p).unwrap();
+        (p, lis)
+    }
+
+    #[test]
+    fn user_owned_socket_outside_run_is_refused() {
+        let (p, lis) = temp_sock();
+        let path = p.to_string_lossy().into_owned();
+        let t = std::thread::spawn(move || {
+            let _ = lis.accept();
+        });
+        let s = UnixStream::connect(&path).unwrap();
+        let err = verify_broker_peer(&path, &s).unwrap_err().to_string();
+        assert!(
+            err.contains("steal") || err.contains("untrusted") || err.contains("refusing"),
+            "{err}"
+        );
+        drop(s);
+        let _ = t.join();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn system_broker_prefix_is_recognized() {
+        assert!(is_system_broker_socket("/run/secret-broker/broker.sock"));
+        assert!(is_system_broker_socket("/var/run/secret-broker/agent.sock"));
+        assert!(!is_system_broker_socket("/tmp/evil.sock"));
+        assert!(!is_system_broker_socket("/home/u/broker.sock"));
     }
 }

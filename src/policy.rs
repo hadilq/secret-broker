@@ -55,15 +55,56 @@ pub fn matches(rule: &[String], args: &[String]) -> bool {
     args.len() == rule.len()
 }
 
-/// `Ok(())` when `args` are allowed, otherwise a human-readable reason.
+/// Sent to the caller on any policy refusal. Must not quote arguments:
+/// a redacted copy would confirm a guessed secret (`[REDACTED]` vs the guess).
+pub const CLIENT_DENY: &str = "arguments not allowed";
+
+/// Forms of `arg` that deny/allow flag globs are matched against.
+/// Combined short flags (`-vh`) expand to `-v` and `-h`; `--foo=bar` also
+/// yields `--foo`.
+pub fn flag_forms(arg: &str) -> Vec<String> {
+    let mut out = vec![arg.to_string()];
+    if let Some(rest) = arg.strip_prefix("--") {
+        if let Some((name, _)) = rest.split_once('=') {
+            if !name.is_empty() {
+                out.push(format!("--{name}"));
+            }
+        }
+        return out;
+    }
+    let bytes = arg.as_bytes();
+    if bytes.len() >= 3
+        && bytes.first() == Some(&b'-')
+        && bytes.get(1) != Some(&b'-')
+        && bytes.iter().skip(1).all(u8::is_ascii_alphabetic)
+    {
+        for c in arg.chars().skip(1) {
+            out.push(format!("-{c}"));
+        }
+    }
+    out
+}
+
+fn is_flag(a: &str) -> bool {
+    a.starts_with('-') && a != "-" && a != "--"
+}
+
+fn glob_any(pats: &[String], s: &str) -> bool {
+    pats.iter().any(|p| glob(p, s))
+}
+
+/// `Ok(())` when `args` are allowed, otherwise a human-readable reason
+/// (for logs). Callers must send [`CLIENT_DENY`] to the client, not this
+/// string, so a guess cannot be confirmed by redaction.
 ///
-/// `deny_tokens` are globs matched against every argument, any position.
-/// They run after positional deny rules and before allow, so a trailing `**`
-/// on an allow rule cannot sneak `--hostname` / `--debug` through.
+/// `deny_tokens` are globs matched against every argument and against each
+/// letter of a combined short flag, any position.
+/// `allow_flags`, when non-empty, is an allowlist: every flag must match.
 pub fn check(
     allow: &[Vec<String>],
     deny: &[Vec<String>],
     deny_tokens: &[String],
+    allow_flags: &[String],
     args: &[String],
 ) -> Result<(), String> {
     if args.iter().any(|a| a.contains('\0')) {
@@ -72,11 +113,23 @@ pub fn check(
     if let Some(r) = deny.iter().find(|r| matches(r, args)) {
         return Err(format!("arguments {args:?} match deny rule {r:?}"));
     }
-    if let Some(tok) = args
-        .iter()
-        .find(|a| deny_tokens.iter().any(|p| glob(p, a)))
-    {
-        return Err(format!("argument {tok:?} is denied"));
+    let mut after_end = false;
+    for a in args {
+        if a == "--" {
+            after_end = true;
+            continue;
+        }
+        if after_end {
+            continue;
+        }
+        let forms = flag_forms(a);
+        if let Some(tok) = forms.iter().find(|f| glob_any(deny_tokens, f)) {
+            return Err(format!("argument {tok:?} is denied"));
+        }
+        if !allow_flags.is_empty() && is_flag(a) && !forms.iter().any(|f| glob_any(allow_flags, f))
+        {
+            return Err(format!("flag {a:?} is not on the allow list"));
+        }
     }
     if allow.iter().any(|r| matches(r, args)) {
         Ok(())
@@ -86,6 +139,7 @@ pub fn check(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -133,7 +187,7 @@ mod tests {
             v(&["run", "list"]),
             v(&["run"]),
         ] {
-            assert!(check(&allow, &deny, none, &a).is_ok(), "{a:?}");
+            assert!(check(&allow, &deny, none, none, &a).is_ok(), "{a:?}");
         }
         for a in [
             v(&["pr"]),
@@ -144,7 +198,7 @@ mod tests {
             v(&[]),
             v(&["pr", "list\0"]),
         ] {
-            assert!(check(&allow, &deny, none, &a).is_err(), "{a:?}");
+            assert!(check(&allow, &deny, none, none, &a).is_err(), "{a:?}");
         }
     }
 
@@ -161,9 +215,10 @@ mod tests {
             "--config",
             "--config=*",
         ]);
-        assert!(check(&allow, &deny, &toks, &v(&["pr", "list"])).is_ok());
-        assert!(check(&allow, &deny, &toks, &v(&["api", "repos/x"])).is_ok());
-        assert!(check(&allow, &deny, &toks, &v(&["pr", "list", "--json"])).is_ok());
+        let none: &[String] = &[];
+        assert!(check(&allow, &deny, &toks, none, &v(&["pr", "list"])).is_ok());
+        assert!(check(&allow, &deny, &toks, none, &v(&["api", "repos/x"])).is_ok());
+        assert!(check(&allow, &deny, &toks, none, &v(&["pr", "list", "--json"])).is_ok());
         for a in [
             v(&["pr", "list", "--hostname", "evil.com"]),
             v(&["pr", "list", "--hostname=evil.com"]),
@@ -173,22 +228,76 @@ mod tests {
             v(&["api", "repos/x", "--config", "/tmp/gh.yml"]),
             v(&["pr", "list", "--config=/tmp/gh.yml"]),
         ] {
-            let err = check(&allow, &deny, &toks, &a).err();
+            let err = check(&allow, &deny, &toks, none, &a).err();
             assert!(
                 err.as_ref().is_some_and(|e| e.contains("is denied")),
                 "{a:?}: {err:?}"
             );
         }
         // Positional deny still wins; empty deny_tokens does not change allow.
-        assert!(check(&allow, &deny, &[], &v(&["pr", "list", "--debug"])).is_ok());
+        assert!(check(&allow, &deny, &[], none, &v(&["pr", "list", "--debug"])).is_ok());
         let deny_auth = vec![v(&["auth", "**"])];
+        assert!(
+            check(&allow, &deny_auth, &toks, none, &v(&["auth", "token"]))
+                .err()
+                .is_some_and(|e| e.contains("deny rule"))
+        );
+    }
+
+    #[test]
+    fn combined_short_flags_and_jq_are_denied() {
+        let allow = vec![v(&["pr", "list", "**"])];
+        let deny: Vec<Vec<String>> = vec![];
+        let toks = v(&["-v", "--jq", "-q", "--quiet", "--jq=*"]);
+        let none: &[String] = &[];
+        assert!(check(&allow, &deny, &toks, none, &v(&["pr", "list"])).is_ok());
+        for a in [
+            v(&["pr", "list", "--jq"]),
+            v(&["pr", "list", "-q"]),
+            v(&["pr", "list", "--quiet"]),
+            v(&["pr", "list", "-vq"]),
+            v(&["pr", "list", "-qh"]),
+            v(&["pr", "list", "--jq=body"]),
+        ] {
+            let err = check(&allow, &deny, &toks, none, &a).err();
+            assert!(
+                err.as_ref().is_some_and(|e| e.contains("is denied")),
+                "{a:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_flags_is_an_allowlist() {
+        let allow = vec![v(&["pr", "list", "**"])];
+        let deny: Vec<Vec<String>> = vec![];
+        let none: &[String] = &[];
+        let flags = v(&["--json", "--limit", "--limit=*"]);
+        assert!(check(&allow, &deny, none, &flags, &v(&["pr", "list", "--json"])).is_ok());
+        assert!(check(&allow, &deny, none, &flags, &v(&["pr", "list", "12"])).is_ok());
+        let err = check(&allow, &deny, none, &flags, &v(&["pr", "list", "--jq"]))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("allow list"), "{err}");
+        // Args after `--` are not flags.
         assert!(check(
             &allow,
-            &deny_auth,
-            &toks,
-            &v(&["auth", "token"])
+            &deny,
+            none,
+            &flags,
+            &v(&["pr", "list", "--", "--jq"])
         )
-        .err()
-        .is_some_and(|e| e.contains("deny rule")));
+        .is_ok());
+    }
+
+    #[test]
+    fn client_deny_does_not_quote_arguments() {
+        assert_eq!(CLIENT_DENY, "arguments not allowed");
+        assert!(!CLIENT_DENY.contains('['));
+        let err = check(&[], &[], &[], &[], &v(&["s3cr3t-guess"]))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("s3cr3t-guess"));
+        assert_ne!(err, CLIENT_DENY);
     }
 }

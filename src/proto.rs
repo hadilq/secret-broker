@@ -356,7 +356,7 @@ pub struct Prompt {
 /// Approval dialog -> broker. kind "pin" is followed by a T_PIN frame.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Answer {
-    /// pin | deny
+    /// pin | deny | ready | unavailable
     pub kind: String,
     pub id: u64,
 }

@@ -125,6 +125,8 @@ enum Incoming {
     Deny(u64),
     /// The dialog could not show a window (no compositor, no font...).
     Unavailable(u64),
+    /// The approval UI is on screen; hardware methods may be armed.
+    Ready(u64),
 }
 
 /// A connection that can answer approval requests: the registered dialog
@@ -159,6 +161,7 @@ impl Channel {
                 },
                 "deny" => Incoming::Deny(a.id),
                 "unavailable" => Incoming::Unavailable(a.id),
+                "ready" => Incoming::Ready(a.id),
                 _ => continue,
             };
             if tx.send(msg).is_err() {
@@ -978,6 +981,25 @@ impl Server {
         p.as_ref().filter(|c| c.alive()).map(Arc::clone)
     }
 
+    fn check_deny_cooldown(&self) -> Result<()> {
+        let cool = Duration::from_secs(self.cfg.approval.deny_cooldown_seconds);
+        let last = *lock_any(&self.last_denied);
+        if crate::approve::deny_cooldown_active(last, cool, Instant::now()) {
+            bail!("approval was denied recently; wait a moment");
+        }
+        Ok(())
+    }
+
+    fn take_gate(&self) -> Result<MutexGuard<'_, ()>> {
+        match self.gate.try_lock() {
+            Ok(g) => Ok(g),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                bail!("another approval is in progress")
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => Ok(p.into_inner()),
+        }
+    }
+
     /// For exec: if sealed, ask the registered dialog for a quick approval.
     fn ensure_open(
         self: &Arc<Self>,
@@ -992,8 +1014,9 @@ impl Server {
             ),
             Mode::Sealed => {}
         }
+        self.check_deny_cooldown()?;
         let started = Instant::now();
-        let _gate = lock_any(&self.gate);
+        let _gate = self.take_gate()?;
         if self.mode() == Mode::Open {
             return Ok(());
         }
@@ -1027,7 +1050,8 @@ impl Server {
         req: &Request,
         caller: &Caller,
     ) -> Result<()> {
-        let _gate = lock_any(&self.gate);
+        self.check_deny_cooldown()?;
+        let _gate = self.take_gate()?;
         match self.mode() {
             Mode::Open => return Ok(()),
             Mode::Cold => bail!("secrets are not in memory; unlock with gpg"),
@@ -1167,17 +1191,35 @@ impl Server {
         let ttl_secs = self.ttl_secs(ttl);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut hints = Vec::new();
-        let hw = Hw::new();
         if methods.iter().any(|m| m == "fido2") {
             hints.push("Touch your security key".to_string());
-            if let Err(e) = hw.start_fido2(&a.fido2, id, purpose) {
-                log(format!("fido2: {e}"));
-            }
         }
-        let approver = sys::name_of(ch.uid).unwrap_or_default();
         for m in &a.pam {
             hints.push(m.label.clone());
-            hw.start_pam(m, &self.helper, &approver);
+        }
+        let owner = self
+            .session_info()
+            .and_then(|s| s.unlocked.or(s.opened))
+            .map(|o| o.user);
+        let pam_user = crate::approve::pam_username(
+            owner.as_deref(),
+            &self.cfg.allowed_users,
+            &sys::name_of(ch.uid).unwrap_or_default(),
+        );
+        let hw = Hw::new();
+        let mut armed = crate::approve::arm_hardware_now(via, false);
+        let start_hw = |hw: &Hw| {
+            if methods.iter().any(|m| m == "fido2") {
+                if let Err(e) = hw.start_fido2(&a.fido2, id, purpose) {
+                    log(format!("fido2: {e}"));
+                }
+            }
+            for m in &a.pam {
+                hw.start_pam(m, &self.helper, &pam_user);
+            }
+        };
+        if armed {
+            start_hw(&hw);
         }
         let timeout = Duration::from_secs(a.timeout_seconds);
         ch.send(&Prompt {
@@ -1235,6 +1277,12 @@ impl Server {
                         "the approval dialog could not open a window; run `secret-broker unlock` in a terminal"
                             .into(),
                     );
+                }
+                Ok(Incoming::Ready(aid)) if aid == id => {
+                    if !armed {
+                        start_hw(&hw);
+                        armed = true;
+                    }
                 }
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
@@ -1309,8 +1357,17 @@ impl Server {
         let Some(p) = self.cfg.profiles.get(&req.profile) else {
             return deny(stream, format!("unknown profile {:?}", req.profile));
         };
-        if let Err(msg) = crate::policy::check(&p.allow, &p.deny, &p.deny_tokens, &req.args) {
-            return deny(stream, msg);
+        if let Err(msg) =
+            crate::policy::check(&p.allow, &p.deny, &p.deny_tokens, &p.allow_flags, &req.args)
+        {
+            log(format!(
+                "exec by uid {} (pid {}) profile {:?} denied: {}",
+                caller.uid,
+                caller.pid,
+                req.profile,
+                self.redact_str(&msg)
+            ));
+            return deny(stream, crate::policy::CLIENT_DENY.to_string());
         }
         let ids = if p.user.is_empty() {
             None
