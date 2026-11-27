@@ -284,8 +284,11 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
 
     // Hide /run (docker.sock, system bus, pcscd, libvirt, ...). A bind of
     // /dev/null over those sockets drops when the daemon restarts and creates
-    // a new inode; a tmpfs on /run does not. Park host /run first: after
-    // tmpfs, bwrap cannot open the original paths as bind sources.
+    // a new inode; a tmpfs on /run does not. `--ro-bind / /` makes /tmp
+    // read-only, so park host /run on a fresh tmpfs, then tmpfs /run, then
+    // bind only the paths we need from the copy. Overlaying /tmp later hides
+    // that copy.
+    push(&["--tmpfs", "/tmp"]);
     push(&["--ro-bind-try", "/run", HOST_RUN]);
     push(&["--tmpfs", "/run"]);
     if fs
@@ -637,7 +640,12 @@ mod tests {
         let p = plan(&cfg(), "default", &ctx(), &fs()).unwrap();
         let a = &p.args;
         assert!(has(a, &["--ro-bind", "/", "/"]));
+        assert!(has(a, &["--tmpfs", "/tmp"]));
         assert!(has(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"]));
+        assert!(
+            pos(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"])
+                > pos(a, &["--tmpfs", "/tmp"])
+        );
         assert!(has(a, &["--tmpfs", "/run"]));
         assert!(
             pos(a, &["--tmpfs", "/run"])
