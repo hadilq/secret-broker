@@ -212,6 +212,20 @@ const BROKER_SOCK: &[&str] = &[
 ];
 const AGENT_SOCK: &str = "/run/secret-broker/agent.sock";
 const BROKER_DIR: &[&str] = &["/run/secret-broker", "/var/run/secret-broker"];
+/// Host `/run` is parked here, then `/tmp` is replaced so the copy is gone
+/// before the command starts. Binds of paths under `/run` must use this
+/// source: after `--tmpfs /run` the original paths are not visible to bwrap.
+const HOST_RUN: &str = "/tmp/.ai-run-host-run";
+
+fn host_run_src(p: &Path) -> PathBuf {
+    if let Ok(rest) = p.strip_prefix("/run") {
+        return Path::new(HOST_RUN).join(rest);
+    }
+    if let Ok(rest) = p.strip_prefix("/var/run") {
+        return Path::new(HOST_RUN).join(rest);
+    }
+    p.to_path_buf()
+}
 
 fn is_broker_sock(p: &Path) -> bool {
     BROKER_SOCK.iter().any(|s| p == Path::new(s))
@@ -270,8 +284,9 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
 
     // Hide /run (docker.sock, system bus, pcscd, libvirt, ...). A bind of
     // /dev/null over those sockets drops when the daemon restarts and creates
-    // a new inode; a tmpfs on /run does not. Re-bind NixOS paths the
-    // sandbox still needs.
+    // a new inode; a tmpfs on /run does not. Park host /run first: after
+    // tmpfs, bwrap cannot open the original paths as bind sources.
+    push(&["--ro-bind-try", "/run", HOST_RUN]);
     push(&["--tmpfs", "/run"]);
     if fs
         .resolve(Path::new("/var/run"))
@@ -281,14 +296,18 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
     }
     push(&[
         "--ro-bind-try",
-        "/run/current-system",
+        &format!("{HOST_RUN}/current-system"),
         "/run/current-system",
     ]);
     if prof.gui {
-        push(&["--ro-bind-try", "/run/opengl-driver", "/run/opengl-driver"]);
         push(&[
             "--ro-bind-try",
-            "/run/opengl-driver-32",
+            &format!("{HOST_RUN}/opengl-driver"),
+            "/run/opengl-driver",
+        ]);
+        push(&[
+            "--ro-bind-try",
+            &format!("{HOST_RUN}/opengl-driver-32"),
             "/run/opengl-driver-32",
         ]);
     }
@@ -306,7 +325,8 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         push(&["--tmpfs", d]);
         push(&["--ro-bind-try", "/dev/null", sock]);
     }
-    push(&["--bind-try", AGENT_SOCK, AGENT_SOCK]);
+    let agent_src = s(&host_run_src(Path::new(AGENT_SOCK)));
+    push(&["--bind-try", &agent_src, AGENT_SOCK]);
 
     // /tmp: per-profile, shared by that profile's instances (Electron's
     // single-instance socket lives there), never the host's.
@@ -344,14 +364,14 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
             }
         }
         for e in expose {
-            a.extend(["--ro-bind-try".into(), s(&e), s(&e)]);
+            a.extend(["--ro-bind-try".into(), s(&host_run_src(&e)), s(&e)]);
         }
         if let Some(d) = &prof.dbus {
             let dir = base.join(format!("proxy-{}", std::process::id()));
             let sock = dir.join("bus");
             p.create_dirs.push(dir);
             let inner = rt.join("bus");
-            a.extend(["--ro-bind".into(), s(&sock), s(&inner)]);
+            a.extend(["--ro-bind".into(), s(&host_run_src(&sock)), s(&inner)]);
             p.env.push((
                 "DBUS_SESSION_BUS_ADDRESS".into(),
                 format!("unix:path={}", s(&inner)),
@@ -617,17 +637,31 @@ mod tests {
         let p = plan(&cfg(), "default", &ctx(), &fs()).unwrap();
         let a = &p.args;
         assert!(has(a, &["--ro-bind", "/", "/"]));
+        assert!(has(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"]));
         assert!(has(a, &["--tmpfs", "/run"]));
-        assert!(pos(a, &["--tmpfs", "/run"]) > pos(a, &["--ro-bind", "/", "/"]));
+        assert!(
+            pos(a, &["--tmpfs", "/run"])
+                > pos(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"])
+        );
         assert!(has(a, &["--tmpfs", "/run/secret-broker"]));
         assert!(has(
             a,
             &[
                 "--bind-try",
-                "/run/secret-broker/agent.sock",
+                "/tmp/.ai-run-host-run/secret-broker/agent.sock",
                 "/run/secret-broker/agent.sock"
             ]
         ));
+        assert!(
+            pos(
+                a,
+                &[
+                    "--bind",
+                    "/run/user/1000/ai-run/default/tmp",
+                    "/tmp"
+                ]
+            ) > pos(a, &["--tmpfs", "/run"])
+        );
         assert!(has(
             a,
             &[
@@ -654,7 +688,7 @@ mod tests {
             a,
             &[
                 "--ro-bind-try",
-                "/run/current-system",
+                "/tmp/.ai-run-host-run/current-system",
                 "/run/current-system"
             ]
         ));
@@ -725,11 +759,12 @@ mod tests {
         assert!(!a.iter().any(|x| x == "/run/docker.sock"));
         assert!(!a.iter().any(|x| x == "/run/dbus/system_bus_socket"));
         assert!(!a.iter().any(|x| x == "/var/run/docker.sock"));
+        assert!(has(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"]));
         assert!(has(
             a,
             &[
                 "--bind-try",
-                "/run/secret-broker/agent.sock",
+                "/tmp/.ai-run-host-run/secret-broker/agent.sock",
                 "/run/secret-broker/agent.sock"
             ]
         ));
@@ -755,7 +790,7 @@ mod tests {
             a,
             &[
                 "--ro-bind-try",
-                "/run/user/1000/wayland-1",
+                "/tmp/.ai-run-host-run/user/1000/wayland-1",
                 "/run/user/1000/wayland-1"
             ]
         ));
@@ -763,7 +798,11 @@ mod tests {
         assert!(has(a, &["--dev-bind-try", "/dev/dri", "/dev/dri"]));
         assert!(has(
             a,
-            &["--ro-bind-try", "/run/opengl-driver", "/run/opengl-driver"]
+            &[
+                "--ro-bind-try",
+                "/tmp/.ai-run-host-run/opengl-driver",
+                "/run/opengl-driver"
+            ]
         ));
         assert!(!a.iter().any(|x| x.contains("S.gpg-agent")));
         let (d, sock) = p.proxy.clone().unwrap();
@@ -773,7 +812,11 @@ mod tests {
         );
         assert!(has(
             a,
-            &["--ro-bind", &sock.to_string_lossy(), "/run/user/1000/bus"]
+            &[
+                "--ro-bind",
+                &host_run_src(&sock).to_string_lossy(),
+                "/run/user/1000/bus"
+            ]
         ));
         let get = |k: &str| p.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         // a profile's env wins over the global env

@@ -47,6 +47,7 @@ pub fn connect_broker() -> Result<UnixStream> {
     Ok(s)
 }
 
+#[cfg(test)]
 fn is_system_broker_socket(path: &str) -> bool {
     let p = std::path::Path::new(path);
     p.starts_with("/run/secret-broker") || p.starts_with("/var/run/secret-broker")
@@ -56,7 +57,6 @@ pub fn verify_broker_peer(path: &str, sock: &UnixStream) -> Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     let p = std::path::Path::new(path);
-    crate::config::check_trusted(p).map_err(|e| e.context("untrusted SECRET_BROKER_SOCKET"))?;
     let cred = crate::sys::peer_cred(sock.as_raw_fd())?;
     let md = std::fs::metadata(p).map_err(|e| Error::from(e).context(path))?;
     if cred.uid != md.uid() {
@@ -66,12 +66,16 @@ pub fn verify_broker_peer(path: &str, sock: &UnixStream) -> Result<()> {
             md.uid()
         );
     }
-    if !is_system_broker_socket(path)
-        && cred.uid == crate::sys::getuid()
-        && crate::sys::getuid() != 0
-    {
+    // systemd SocketMode=0660 is group-writable on purpose so allowed users
+    // can connect. World-writable would let anyone replace the inode.
+    if md.mode() & 0o002 != 0 {
+        bail!("SECRET_BROKER_SOCKET {path} is world writable");
+    }
+    let me = crate::sys::getuid();
+    if cred.uid == me && me != 0 {
         bail!(
-            "refusing SECRET_BROKER_SOCKET={path}: a user-owned socket outside /run/secret-broker can steal the data key or PIN"
+            "refusing SECRET_BROKER_SOCKET={path}: a user-owned socket can steal the data key or PIN (peer uid {} is this process)",
+            cred.uid
         );
     }
     Ok(())
@@ -689,6 +693,7 @@ pub fn run(profile: &str, args: &[String], force_stdin: bool, no_stdin: bool) ->
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
@@ -708,6 +713,11 @@ mod tests {
     #[test]
     fn user_owned_socket_outside_run_is_refused() {
         let (p, lis) = temp_sock();
+        // Same as systemd SocketMode=0660: group-writable is required so
+        // allowed users can connect. That must not be treated as untrusted.
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o660);
+        std::fs::set_permissions(&p, perm).unwrap();
         let path = p.to_string_lossy().into_owned();
         let t = std::thread::spawn(move || {
             let _ = lis.accept();
@@ -715,8 +725,12 @@ mod tests {
         let s = UnixStream::connect(&path).unwrap();
         let err = verify_broker_peer(&path, &s).unwrap_err().to_string();
         assert!(
-            err.contains("steal") || err.contains("untrusted") || err.contains("refusing"),
+            err.contains("steal") || err.contains("this process") || err.contains("refusing"),
             "{err}"
+        );
+        assert!(
+            !err.contains("world writable") && !err.contains("group/world"),
+            "0660 is how the real broker socket is mode'd: {err}"
         );
         drop(s);
         let _ = t.join();
