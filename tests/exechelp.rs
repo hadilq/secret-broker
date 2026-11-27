@@ -20,13 +20,15 @@ fn helper(allowed: &[(u32, u32)]) -> exechelp::Helper {
 }
 
 fn which(name: &str) -> String {
-    let found: Option<PathBuf> = std::env::var_os("PATH").and_then(|p| {
-        std::env::split_paths(&p)
-            .map(|d| d.join(name))
-            .find(|c| c.is_file())
-    });
-    found
-        .unwrap_or_else(|| panic!("{name} not on PATH"))
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.push(PathBuf::from("/usr/bin"));
+    dirs.push(PathBuf::from("/bin"));
+    dirs.into_iter()
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("{name} not found on PATH"))
         .to_string_lossy()
         .into_owned()
 }
@@ -123,8 +125,8 @@ fn helper_secret_env_roundtrip_keeps_binary() {
     let stderr = std::fs::File::open("/dev/null").unwrap();
     let (st_r, st_w) = sys::pipe().unwrap();
     let req = SpawnReq {
-        command: which("sh"),
-        args: vec!["-c".into(), "printf %s \"$TOK\"".into()],
+        command: which("printenv"),
+        args: vec!["TOK".into()],
         extra_env: vec![],
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         uid: sys::getuid(),
@@ -146,7 +148,7 @@ fn helper_secret_env_roundtrip_keeps_binary() {
     drop(st_w);
     let mut out = Vec::new();
     std::fs::File::from(out_r).read_to_end(&mut out).unwrap();
-    assert_eq!(out, b"\xffsecret-bytes");
+    assert_eq!(out, b"\xffsecret-bytes\n");
     let mut st = String::new();
     std::fs::File::from(st_r).read_to_string(&mut st).unwrap();
     assert!(

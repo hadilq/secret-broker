@@ -215,6 +215,8 @@ const MAX_FDS: usize = 8;
 
 /// Protocol cap for a helper frame. A `SOCK_SEQPACKET` send still cannot
 /// exceed `SO_SNDBUF` (about 208 KiB by default; we raise it toward this).
+/// Darwin `socketpair` has no `SOCK_SEQPACKET`; we fall back to `SOCK_STREAM`
+/// with a 4-byte length prefix so messages still do not coalesce.
 pub const HELPER_MAX_FRAME: usize = 1 << 20;
 
 fn interrupted(err: &std::io::Error) -> bool {
@@ -273,24 +275,66 @@ pub fn frame_too_large(got: usize, limit: usize) -> Error {
     ))
 }
 
-/// Connected `SOCK_SEQPACKET` pair: one `sendmsg` is one `recvmsg` (no
-/// coalescing, unlike `UnixStream::pair()` which is `SOCK_STREAM`).
+fn socketpair_unix(ty: libc::c_int) -> std::io::Result<[RawFd; 2]> {
+    let mut fds = [-1, -1];
+    // SAFETY: fds is a valid 2-int array for socketpair.
+    let r = unsafe { libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr()) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fds)
+}
+
+fn sock_type(fd: RawFd) -> Option<libc::c_int> {
+    let mut ty: libc::c_int = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).ok()?;
+    // SAFETY: ty/len are writable locals of the right size.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::from_mut(&mut ty).cast(),
+            &mut len,
+        )
+    };
+    (r == 0).then_some(ty)
+}
+
+fn is_seqpacket(fd: RawFd) -> bool {
+    sock_type(fd) == Some(libc::SOCK_SEQPACKET)
+}
+
+/// Connected unix pair. Prefers `SOCK_SEQPACKET` (one sendmsg is one recvmsg).
+/// Darwin `socketpair` rejects SEQPACKET (`EPROTONOSUPPORT`); we use STREAM
+/// there and length-prefix in [`send_fds`] / [`recv_fds`].
 pub fn seqpacket_pair() -> Result<(
     std::os::unix::net::UnixStream,
     std::os::unix::net::UnixStream,
 )> {
     use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
-    let mut fds = [-1, -1];
     #[cfg(target_os = "linux")]
-    let ty = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+    let seq_ty = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
     #[cfg(target_os = "macos")]
-    let ty = libc::SOCK_SEQPACKET;
-    // SAFETY: fds is a valid 2-int array for socketpair.
-    let r = unsafe { libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr()) };
-    if r != 0 {
-        return Err(last_os_error("socketpair(SEQPACKET)"));
-    }
+    let seq_ty = libc::SOCK_SEQPACKET;
+    let fds = match socketpair_unix(seq_ty) {
+        Ok(fds) => fds,
+        Err(err)
+            if err.raw_os_error() == Some(libc::EPROTONOSUPPORT)
+                || err.raw_os_error() == Some(libc::EPROTOTYPE) =>
+        {
+            #[cfg(target_os = "linux")]
+            let stream_ty = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+            #[cfg(target_os = "macos")]
+            let stream_ty = libc::SOCK_STREAM;
+            socketpair_unix(stream_ty)
+                .map_err(|e| Error::msg(format!("socketpair(STREAM): {e}")))?
+        }
+        Err(err) => {
+            return Err(Error::msg(format!("socketpair(SEQPACKET): {err}")));
+        }
+    };
     let [a, b] = fds;
     #[cfg(target_os = "macos")]
     {
@@ -303,16 +347,7 @@ pub fn seqpacket_pair() -> Result<(
     Ok(unsafe { (UnixStream::from_raw_fd(a), UnixStream::from_raw_fd(b)) })
 }
 
-/// Send `payload` and `fds` in one `sendmsg` (SCM_RIGHTS) on an AF_UNIX socket.
-pub fn send_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<()> {
-    if fds.len() > MAX_FDS {
-        bail!("too many fds");
-    }
-    if let Ok(limit) = seqpacket_payload_limit(sock) {
-        if payload.len() > limit {
-            return Err(frame_too_large(payload.len(), limit));
-        }
-    }
+fn sendmsg_once(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<usize> {
     let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(fds.len());
     loop {
         let mut iov = libc::iovec {
@@ -352,11 +387,51 @@ pub fn send_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<()> {
             }
             return Err(last_os_error("sendmsg"));
         }
-        if usize::try_from(n).unwrap_or(0) != payload.len() {
+        return Ok(usize::try_from(n).unwrap_or(0));
+    }
+}
+
+/// Send `payload` and `fds` (SCM_RIGHTS). A `u32be` length prefix keeps STREAM
+/// sockets from coalescing two helper frames into one `recv`.
+pub fn send_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<()> {
+    if fds.len() > MAX_FDS {
+        bail!("too many fds");
+    }
+    if payload.len() > HELPER_MAX_FRAME {
+        return Err(frame_too_large(
+            payload.len(),
+            seqpacket_payload_limit(sock).unwrap_or(HELPER_MAX_FRAME),
+        ));
+    }
+    let plen = u32::try_from(payload.len()).map_err(|_| Error::msg("payload too large"))?;
+    let mut framed = Zeroizing::new(Vec::new());
+    framed.extend_from_slice(&plen.to_be_bytes());
+    framed.extend_from_slice(payload);
+    if is_seqpacket(sock) {
+        if let Ok(limit) = seqpacket_payload_limit(sock) {
+            if framed.len() > limit {
+                return Err(frame_too_large(payload.len(), limit));
+            }
+        }
+        let n = sendmsg_once(sock, &framed, fds)?;
+        if n != framed.len() {
             return Err(last_os_error("sendmsg"));
         }
         return Ok(());
     }
+    let mut off = 0usize;
+    let mut first = true;
+    while off < framed.len() {
+        let rest = framed.get(off..).unwrap_or(&[]);
+        let pass = if first { fds } else { &[][..] };
+        let n = sendmsg_once(sock, rest, pass)?;
+        if n == 0 {
+            return Err(Error::msg("sendmsg: eof"));
+        }
+        first = false;
+        off = off.saturating_add(n);
+    }
+    Ok(())
 }
 
 fn poll_in(fd: RawFd) -> Result<libc::c_short> {
@@ -392,32 +467,30 @@ fn fionread(fd: RawFd) -> Option<usize> {
     usize::try_from(n).ok()
 }
 
-/// Receive one `send_fds` message. `max_payload` is a cap, not the allocation:
-/// we size the (zeroizing) buffer from `FIONREAD` after poll.
-pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Zeroizing<Vec<u8>>, Vec<RawFd>)> {
-    let revents = poll_in(sock)?;
-    if revents & libc::POLLIN == 0 && revents & libc::POLLHUP != 0 {
-        return Err(Error::msg("recvmsg: eof"));
+struct Recvd {
+    n: usize,
+    fds: Vec<RawFd>,
+    flags: libc::c_int,
+}
+
+fn recvmsg_into(sock: RawFd, buf: &mut [u8]) -> Result<Recvd> {
+    if buf.is_empty() {
+        return Ok(Recvd {
+            n: 0,
+            fds: Vec::new(),
+            flags: 0,
+        });
     }
-    let avail = fionread(sock);
-    // Darwin AF_UNIX SEQPACKET often reports FIONREAD=0 even when a message
-    // is readable. A 1-byte buffer then truncates the frame and the helper
-    // treats it as shutdown. Only trust a positive size.
-    let hint = match avail {
-        Some(n) if n > 0 => n.min(max_payload.max(1)),
-        _ => max_payload.max(1),
-    };
-    let mut payload = Zeroizing::new(vec![0u8; hint]);
     let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(MAX_FDS);
     loop {
         let mut fds = Vec::new();
         let flags: libc::c_int;
-        // SAFETY: recvmsg into `payload`/`cbuf` we own; CMSG_* walk the kernel's
+        // SAFETY: recvmsg into `buf`/`cbuf` we own; CMSG_* walk the kernel's
         // control message; copied fds are new descriptors we take ownership of.
         let n = unsafe {
             let mut iov = libc::iovec {
-                iov_base: payload.as_mut_ptr().cast(),
-                iov_len: payload.len(),
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
             };
             let cap = usize::try_from(libc::CMSG_SPACE(fd_bytes as libc::c_uint)).unwrap_or(1);
             let mut cbuf = vec![0u8; cap.max(1)];
@@ -464,20 +537,93 @@ pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Zeroizing<Vec<u8>>, 
             }
             return Err(last_os_error("recvmsg"));
         }
-        if n == 0 {
+        return Ok(Recvd {
+            n: usize::try_from(n).unwrap_or(0),
+            fds,
+            flags,
+        });
+    }
+}
+
+fn recv_exact(sock: RawFd, buf: &mut [u8], fds: &mut Vec<RawFd>) -> Result<()> {
+    let mut off = 0usize;
+    while off < buf.len() {
+        let rest = buf.get_mut(off..).unwrap_or(&mut []);
+        let got = recvmsg_into(sock, rest)?;
+        if got.n == 0 {
             return Err(Error::msg("recvmsg: eof"));
         }
-        if flags & libc::MSG_TRUNC != 0 {
-            for fd in &fds {
+        fds.extend(got.fds);
+        off = off.saturating_add(got.n);
+    }
+    Ok(())
+}
+
+fn split_frame(buf: &[u8], max_payload: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let hdr = buf
+        .get(..4)
+        .ok_or_else(|| Error::msg("truncated helper frame"))?;
+    let arr: [u8; 4] = hdr
+        .try_into()
+        .map_err(|_| Error::msg("truncated helper frame"))?;
+    let n = usize::try_from(u32::from_be_bytes(arr)).unwrap_or(0);
+    if n > max_payload {
+        bail!("helper frame is {n} bytes; max is {max_payload}. Shrink the secret environment");
+    }
+    let body = buf
+        .get(4..4usize.saturating_add(n))
+        .ok_or_else(|| Error::msg("truncated helper frame"))?;
+    Ok(Zeroizing::new(body.to_vec()))
+}
+
+/// Receive one `send_fds` message. `max_payload` caps the body after the
+/// length prefix. STREAM sockets read exactly that many bytes so a later
+/// frame is not consumed.
+pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Zeroizing<Vec<u8>>, Vec<RawFd>)> {
+    if is_seqpacket(sock) {
+        let revents = poll_in(sock)?;
+        if revents & libc::POLLIN == 0 && revents & libc::POLLHUP != 0 {
+            return Err(Error::msg("recvmsg: eof"));
+        }
+        let cap = max_payload.saturating_add(4);
+        let avail = fionread(sock);
+        let hint = match avail {
+            Some(n) if n > 0 => n.min(cap.max(1)),
+            _ => cap.max(1),
+        };
+        let mut buf = Zeroizing::new(vec![0u8; hint]);
+        let got = recvmsg_into(sock, &mut buf)?;
+        if got.n == 0 {
+            return Err(Error::msg("recvmsg: eof"));
+        }
+        if got.flags & libc::MSG_TRUNC != 0 {
+            for fd in &got.fds {
                 close_fd(*fd);
             }
             return Err(Error::msg(format!(
                 "SOCK_SEQPACKET message larger than {} bytes; shrink the secret environment",
-                payload.len()
+                buf.len()
             )));
         }
-        payload.truncate(usize::try_from(n).unwrap_or(0));
-        return Ok((payload, fds));
+        buf.truncate(got.n);
+        let payload = split_frame(&buf, max_payload)?;
+        Ok((payload, got.fds))
+    } else {
+        let mut fds = Vec::new();
+        let mut hdr = [0u8; 4];
+        recv_exact(sock, &mut hdr, &mut fds)?;
+        let n = usize::try_from(u32::from_be_bytes(hdr)).unwrap_or(0);
+        if n > max_payload {
+            for fd in &fds {
+                close_fd(*fd);
+            }
+            bail!("helper frame is {n} bytes; max is {max_payload}. Shrink the secret environment");
+        }
+        let mut payload = Zeroizing::new(vec![0u8; n]);
+        if n > 0 {
+            recv_exact(sock, &mut payload, &mut fds)?;
+        }
+        Ok((payload, fds))
     }
 }
 
@@ -905,9 +1051,10 @@ pub fn pid_alive(pid: i32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Block until `pid` has exited, but do not reap it (`WNOWAIT`). The pid stays
-/// a zombie so it cannot be reused until a later `waitpid`. Callers remove the
-/// pid from any kill-allow set in between.
+/// Block until `pid` has exited, but do not reap it. The pid stays a zombie so
+/// it cannot be reused until a later `waitpid`. Callers remove the pid from any
+/// kill-allow set in between.
+#[cfg(target_os = "linux")]
 pub fn waitid_exited_nowait(pid: u32) -> std::io::Result<()> {
     let id = libc::id_t::from(pid);
     loop {
@@ -926,6 +1073,68 @@ pub fn waitid_exited_nowait(pid: u32) -> std::io::Result<()> {
         }
         return Err(err);
     }
+}
+
+/// Darwin: `kqueue` `EVFILT_PROC`/`NOTE_EXIT` does not reap. `waitid(WNOWAIT)`
+/// is POSIX but has been unreliable for this on macOS.
+#[cfg(target_os = "macos")]
+pub fn waitid_exited_nowait(pid: u32) -> std::io::Result<()> {
+    let ident = usize::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid"))?;
+    // SAFETY: kqueue takes no arguments.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let change = libc::kevent {
+        ident,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: register one EVFILT_PROC watch; change lives across the call.
+    let add = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    if add < 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: we own kq.
+        unsafe {
+            libc::close(kq);
+        }
+        return Err(err);
+    }
+    loop {
+        let mut event = libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: wait for the one-shot NOTE_EXIT; event is an out-parameter.
+        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if interrupted(&err) {
+                continue;
+            }
+            // SAFETY: we own kq.
+            unsafe {
+                libc::close(kq);
+            }
+            return Err(err);
+        }
+        if n > 0 {
+            break;
+        }
+    }
+    // SAFETY: we own kq.
+    unsafe {
+        libc::close(kq);
+    }
+    Ok(())
 }
 
 /// Fill `buf` from the kernel CSPRNG (getrandom(2), blocking until seeded).
@@ -1312,6 +1521,20 @@ mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    fn find_bin(name: &str) -> PathBuf {
+        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        dirs.push(PathBuf::from("/usr/bin"));
+        dirs.push(PathBuf::from("/bin"));
+        dirs.into_iter()
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("{name} not found on PATH"))
+    }
 
     #[test]
     fn peer_cred_of_socketpair_is_us() {
@@ -1421,6 +1644,19 @@ mod tests {
     }
 
     #[test]
+    fn stream_pair_does_not_coalesce_messages() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        send_fds(a.as_raw_fd(), b"one", &[]).unwrap();
+        send_fds(a.as_raw_fd(), b"two", &[]).unwrap();
+        let (p1, f1) = recv_fds(b.as_raw_fd(), 64).unwrap();
+        assert_eq!(&p1[..], b"one");
+        assert!(f1.is_empty());
+        let (p2, f2) = recv_fds(b.as_raw_fd(), 64).unwrap();
+        assert_eq!(&p2[..], b"two");
+        assert!(f2.is_empty());
+    }
+
+    #[test]
     fn send_fds_names_sndbuf_when_message_too_big() {
         let (a, b) = seqpacket_pair().unwrap();
         drop(b);
@@ -1438,14 +1674,21 @@ mod tests {
         };
         assert_eq!(r, 0);
         let payload = vec![0u8; 64 * 1024];
-        let err = send_fds(a.as_raw_fd(), &payload, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("SO_SNDBUF"), "{err}");
-        assert!(err.contains("65536"), "{err}");
-        assert!(err.contains("secret environment"), "{err}");
-        let limit = seqpacket_payload_limit(a.as_raw_fd()).unwrap();
-        assert!(err.contains(&limit.to_string()), "{err}");
+        match send_fds(a.as_raw_fd(), &payload, &[]) {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(err.contains("SO_SNDBUF"), "{err}");
+                assert!(err.contains("65536"), "{err}");
+                assert!(err.contains("secret environment"), "{err}");
+                let limit = seqpacket_payload_limit(a.as_raw_fd()).unwrap();
+                assert!(err.contains(&limit.to_string()), "{err}");
+            }
+            Ok(()) => {
+                // Darwin unix SEQPACKET often ignores SO_SNDBUF as a message cap.
+                #[cfg(target_os = "linux")]
+                panic!("expected sendmsg to fail with EMSGSIZE");
+            }
+        }
     }
 
     extern "C" fn recv_eintr_nop(_: libc::c_int) {}
@@ -1453,19 +1696,16 @@ mod tests {
     #[test]
     #[allow(clippy::fn_to_numeric_cast)]
     fn recv_fds_retries_eintr() {
+        static SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = SIGNAL_LOCK.lock().unwrap();
         let (a, b) = seqpacket_pair().unwrap();
-        let mut old: libc::sigaction = {
-            // SAFETY: sigaction is a plain C struct; zeroed is a valid out-value.
-            unsafe { std::mem::zeroed() }
+        // SAFETY: nop handler so SIGUSR1 is not fatal; we restore SIG_DFL after.
+        let prev = unsafe {
+            libc::signal(
+                libc::SIGUSR1,
+                recv_eintr_nop as *const () as libc::sighandler_t,
+            )
         };
-        // SAFETY: nop handler; we restore `old` before returning.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = recv_eintr_nop as *const () as usize;
-            libc::sigemptyset(&mut sa.sa_mask);
-            sa.sa_flags = 0; // no SA_RESTART: recvmsg must surface EINTR
-            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, &mut old), 0);
-        }
         // SAFETY: pthread_self returns this thread's id.
         let tid = unsafe { libc::pthread_self() };
         let killer = std::thread::spawn(move || {
@@ -1485,14 +1725,15 @@ mod tests {
         let _ = killer.join();
         // SAFETY: restore the previous handler.
         unsafe {
-            libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut());
+            libc::signal(libc::SIGUSR1, prev);
         }
     }
 
     #[test]
     fn waitid_nowait_holds_zombie_until_reap() {
-        // `/bin/true` does not exist in the Nix sandbox; `true` is on PATH.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let mut child = std::process::Command::new(find_bin("true"))
+            .spawn()
+            .unwrap();
         let pid = child.id();
         waitid_exited_nowait(pid).unwrap();
         let raw = i32::try_from(pid).unwrap();
@@ -1542,8 +1783,8 @@ mod tests {
         let extra = str_env_c(&[("LANG".into(), "C".into())]).unwrap();
         let secrets =
             secret_env_c(&[("TOK".into(), Zeroizing::new(b"\xffsecret-bytes".to_vec()))]).unwrap();
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "printf %s \"$TOK\""]);
+        let mut cmd = std::process::Command::new(find_bin("printenv"));
+        cmd.arg("TOK");
         // SAFETY: clearenv/setenv in the child; buffers live until spawn returns.
         unsafe {
             cmd.pre_exec(move || {
@@ -1554,7 +1795,7 @@ mod tests {
         let out = cmd.output().unwrap();
         assert_eq!(
             out.stdout,
-            b"\xffsecret-bytes",
+            b"\xffsecret-bytes\n",
             "stderr={}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -1563,8 +1804,8 @@ mod tests {
     #[test]
     fn command_env_clear_discards_pre_exec_setenv() {
         let secrets = secret_env_c(&[("TOK".into(), Zeroizing::new(b"secret".to_vec()))]).unwrap();
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "printf %s \"${TOK:-missing}\""])
+        let mut cmd = std::process::Command::new(find_bin("printenv"));
+        cmd.arg("TOK")
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default());
         // SAFETY: setenv in the child; this is the pattern spawn must not use.
@@ -1575,9 +1816,10 @@ mod tests {
             });
         }
         let out = cmd.output().unwrap();
-        assert_eq!(
-            out.stdout, b"missing",
-            "std execve uses Command's envp; env_clear must not be used on profile spawn"
+        assert!(
+            out.stdout.is_empty(),
+            "std execve uses Command's envp; env_clear must not be used on profile spawn, got {:?}",
+            out.stdout
         );
     }
 }
