@@ -1672,7 +1672,14 @@ mod tests {
                 len,
             )
         };
-        assert_eq!(r, 0);
+        if r != 0 {
+            // Darwin AF_UNIX socketpair often rejects SO_SNDBUF (errno 1/22).
+            let err = std::io::Error::last_os_error();
+            if cfg!(target_os = "linux") {
+                panic!("setsockopt SO_SNDBUF: {err}");
+            }
+            return;
+        }
         let payload = vec![0u8; 64 * 1024];
         match send_fds(a.as_raw_fd(), &payload, &[]) {
             Err(e) => {
