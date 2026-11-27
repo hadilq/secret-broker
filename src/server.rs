@@ -1662,21 +1662,21 @@ fn spawn_local(
     let home_c = CString::new(home.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "home path contains NUL")
     })?;
+    let extra_c = sys::str_env_c(extra_env)?;
+    let secret_env = sys::secret_env_c(secrets)?;
     let mut cmd = Command::new(command);
+    // Do not env_clear/env: std then calls execve with its own envp and
+    // drops everything `setenv` wrote in pre_exec.
     cmd.args(args)
-        .env_clear()
-        .envs(extra_env.iter().cloned())
         .process_group(0)
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut secret_env = sys::secret_env_c(secrets)?;
     // SAFETY: chdir + dumpable + setenv; buffers live until spawn returns.
     unsafe {
         cmd.pre_exec(move || {
             sys::chdir(&home_c)?;
-            sys::install_secret_env(&secret_env)?;
-            sys::wipe_secret_env(&mut secret_env);
+            sys::apply_child_env(&extra_c, &secret_env)?;
             let _ = sys::set_non_dumpable();
             let _ = sys::drop_all_caps();
             sys::close_from(3);

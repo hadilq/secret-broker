@@ -11,21 +11,48 @@ use secret_broker::exechelp::{self, SpawnReq};
 use secret_broker::sys;
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
+
+fn helper(allowed: &[(u32, u32)]) -> exechelp::Helper {
+    let exe = Path::new(env!("CARGO_BIN_EXE_secret-broker"));
+    exechelp::Helper::spawn(exe, allowed).expect("exec-helper must start")
+}
+
+fn which(name: &str) -> String {
+    let found: Option<PathBuf> = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(name))
+            .find(|c| c.is_file())
+    });
+    found
+        .unwrap_or_else(|| panic!("{name} not on PATH"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn nulls() -> [std::fs::File; 3] {
+    [
+        std::fs::File::open("/dev/null").unwrap(),
+        std::fs::File::open("/dev/null").unwrap(),
+        std::fs::File::open("/dev/null").unwrap(),
+    ]
+}
+
+#[test]
+fn helper_starts_and_answers() {
+    let h = helper(&[(u32::MAX, u32::MAX)]);
+    let err = h.kill(1).unwrap_err().to_string();
+    assert!(err.contains("not a child"), "{err}");
+}
 
 #[test]
 fn helper_refuses_uid_not_in_allowlist() {
-    let exe = Path::new(env!("CARGO_BIN_EXE_secret-broker"));
-    let Ok(h) = exechelp::Helper::spawn(exe, &[(u32::MAX, u32::MAX)]) else {
-        return;
-    };
-    let n1 = std::fs::File::open("/dev/null").unwrap();
-    let n2 = std::fs::File::open("/dev/null").unwrap();
-    let n3 = std::fs::File::open("/dev/null").unwrap();
+    let h = helper(&[(u32::MAX, u32::MAX)]);
+    let n = nulls();
     let (_st_r, st_w) = sys::pipe().unwrap();
     let req = SpawnReq {
-        command: "/bin/true".into(),
+        command: which("true"),
         args: vec![],
         extra_env: vec![],
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
@@ -37,9 +64,9 @@ fn helper_refuses_uid_not_in_allowlist() {
             &req,
             &[],
             [
-                n1.as_raw_fd(),
-                n2.as_raw_fd(),
-                n3.as_raw_fd(),
+                n[0].as_raw_fd(),
+                n[1].as_raw_fd(),
+                n[2].as_raw_fd(),
                 st_w.as_raw_fd(),
             ],
         )
@@ -50,76 +77,36 @@ fn helper_refuses_uid_not_in_allowlist() {
 
 #[test]
 fn helper_refuses_kill_of_foreign_pid() {
-    let exe = Path::new(env!("CARGO_BIN_EXE_secret-broker"));
-    let Ok(h) = exechelp::Helper::spawn(exe, &[(u32::MAX, u32::MAX)]) else {
-        return;
-    };
+    let h = helper(&[(u32::MAX, u32::MAX)]);
     let err = h.kill(1).unwrap_err().to_string();
     assert!(err.contains("not a child"), "{err}");
 }
 
-fn helper_for_self() -> Option<exechelp::Helper> {
-    let exe = Path::new(env!("CARGO_BIN_EXE_secret-broker"));
-    exechelp::Helper::spawn(exe, &[(sys::getuid(), sys::getgid())]).ok()
-}
-
-fn nulls() -> [std::fs::File; 3] {
-    [
-        std::fs::File::open("/dev/null").unwrap(),
-        std::fs::File::open("/dev/null").unwrap(),
-        std::fs::File::open("/dev/null").unwrap(),
-    ]
-}
-
-/// Live spawn needs setgroups; skip when the helper is unprivileged.
-fn start_or_skip(
-    h: &exechelp::Helper,
-    req: &SpawnReq,
-    secrets: &[(String, Zeroizing<Vec<u8>>)],
-    fds: [i32; 4],
-) -> Option<u32> {
-    match h.start(req, secrets, fds) {
-        Ok(pid) => Some(pid),
-        Err(e) => {
-            let s = e.to_string();
-            if s.contains("Operation not permitted") || s.contains("not permitted") {
-                eprintln!("skip: exec-helper cannot setgroups/setuid ({s})");
-                None
-            } else {
-                panic!("helper start: {s}");
-            }
-        }
-    }
-}
-
 #[test]
 fn helper_refuses_kill_after_child_exits() {
-    let Some(h) = helper_for_self() else {
-        return;
-    };
+    let h = helper(&[(sys::getuid(), sys::getgid())]);
     let n = nulls();
     let (st_r, st_w) = sys::pipe().unwrap();
     let req = SpawnReq {
-        command: "/bin/true".into(),
+        command: which("true"),
         args: vec![],
         extra_env: vec![],
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         uid: sys::getuid(),
         gid: sys::getgid(),
     };
-    let Some(pid) = start_or_skip(
-        &h,
-        &req,
-        &[],
-        [
-            n[0].as_raw_fd(),
-            n[1].as_raw_fd(),
-            n[2].as_raw_fd(),
-            st_w.as_raw_fd(),
-        ],
-    ) else {
-        return;
-    };
+    let pid = h
+        .start(
+            &req,
+            &[],
+            [
+                n[0].as_raw_fd(),
+                n[1].as_raw_fd(),
+                n[2].as_raw_fd(),
+                st_w.as_raw_fd(),
+            ],
+        )
+        .expect("spawn as self must work without CAP_SETUID");
     drop(st_w);
     let mut buf = String::new();
     std::fs::File::from(st_r).read_to_string(&mut buf).unwrap();
@@ -130,15 +117,13 @@ fn helper_refuses_kill_after_child_exits() {
 
 #[test]
 fn helper_secret_env_roundtrip_keeps_binary() {
-    let Some(h) = helper_for_self() else {
-        return;
-    };
+    let h = helper(&[(sys::getuid(), sys::getgid())]);
     let stdin = std::fs::File::open("/dev/null").unwrap();
     let (out_r, out_w) = sys::pipe().unwrap();
     let stderr = std::fs::File::open("/dev/null").unwrap();
     let (st_r, st_w) = sys::pipe().unwrap();
     let req = SpawnReq {
-        command: "/bin/sh".into(),
+        command: which("sh"),
         args: vec!["-c".into(), "printf %s \"$TOK\"".into()],
         extra_env: vec![],
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
@@ -146,8 +131,7 @@ fn helper_secret_env_roundtrip_keeps_binary() {
         gid: sys::getgid(),
     };
     let tok = Zeroizing::new(b"\xffsecret-bytes".to_vec());
-    let Some(_) = start_or_skip(
-        &h,
+    h.start(
         &req,
         &[("TOK".into(), tok)],
         [
@@ -156,9 +140,8 @@ fn helper_secret_env_roundtrip_keeps_binary() {
             stderr.as_raw_fd(),
             st_w.as_raw_fd(),
         ],
-    ) else {
-        return;
-    };
+    )
+    .expect("spawn as self must work without CAP_SETUID");
     drop(out_w);
     drop(st_w);
     let mut out = Vec::new();

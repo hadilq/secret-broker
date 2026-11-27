@@ -396,14 +396,16 @@ fn fionread(fd: RawFd) -> Option<usize> {
 /// we size the (zeroizing) buffer from `FIONREAD` after poll.
 pub fn recv_fds(sock: RawFd, max_payload: usize) -> Result<(Zeroizing<Vec<u8>>, Vec<RawFd>)> {
     let revents = poll_in(sock)?;
-    let avail = fionread(sock);
-    if avail == Some(0) && (revents & libc::POLLHUP != 0 || revents & libc::POLLIN == 0) {
+    if revents & libc::POLLIN == 0 && revents & libc::POLLHUP != 0 {
         return Err(Error::msg("recvmsg: eof"));
     }
+    let avail = fionread(sock);
+    // Darwin AF_UNIX SEQPACKET often reports FIONREAD=0 even when a message
+    // is readable. A 1-byte buffer then truncates the frame and the helper
+    // treats it as shutdown. Only trust a positive size.
     let hint = match avail {
-        Some(0) => 1,
-        Some(n) => n.min(max_payload.max(1)),
-        None => max_payload.max(1),
+        Some(n) if n > 0 => n.min(max_payload.max(1)),
+        _ => max_payload.max(1),
     };
     let mut payload = Zeroizing::new(vec![0u8; hint]);
     let fd_bytes = std::mem::size_of::<RawFd>().saturating_mul(MAX_FDS);
@@ -507,14 +509,17 @@ pub fn chdir(path: &std::ffi::CStr) -> std::io::Result<()> {
 /// remaining boundary is the dedicated `sb-*` uid and `ProtectProc=invisible`.
 /// The parent then needs `CAP_KILL` to signal the child.
 pub fn apply_profile_creds(uid: u32, gid: u32) -> std::io::Result<()> {
-    // SAFETY: setgroups(0) clears the list; the uid/gid calls take integer ids.
-    let r = unsafe {
-        if libc::setgroups(0, std::ptr::null()) != 0 {
-            -1
-        } else {
-            apply_ids(uid, gid)
+    // SAFETY: setgroups(0) clears the list.
+    let sg = unsafe { libc::setgroups(0, std::ptr::null()) };
+    if sg != 0 {
+        let err = std::io::Error::last_os_error();
+        let already = getuid() == uid && getgid() == gid;
+        if !(already && err.raw_os_error() == Some(libc::EPERM)) {
+            return Err(err);
         }
-    };
+    }
+    // SAFETY: integer ids; caller has CAP_SETUID/CAP_SETGID, or already is uid/gid.
+    let r = unsafe { apply_ids(uid, gid) };
     if r != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -535,13 +540,15 @@ unsafe fn apply_ids(uid: u32, gid: u32) -> i32 {
 unsafe fn apply_ids(uid: u32, gid: u32) -> i32 {
     // SAFETY: integer ids. Darwin has no setresuid; privileged setuid sets
     // real, effective, and saved.
-    if unsafe { libc::setgid(gid) } != 0 {
-        return -1;
-    }
-    if unsafe { libc::setuid(uid) } != 0 {
-        -1
-    } else {
-        0
+    unsafe {
+        if libc::setgid(gid) != 0 {
+            return -1;
+        }
+        if libc::setuid(uid) != 0 {
+            -1
+        } else {
+            0
+        }
     }
 }
 
@@ -594,12 +601,86 @@ pub fn install_secret_env(pairs: &SecretEnvC) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn wipe_secret_env(pairs: &mut SecretEnvC) {
-    use zeroize::Zeroize;
+pub fn str_env_c(pairs: &[(String, String)]) -> std::io::Result<Vec<(CString, CString)>> {
+    let mut o = Vec::new();
     for (k, v) in pairs {
-        k.zeroize();
-        v.zeroize();
+        let kc = CString::new(k.as_str()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "env key contains NUL")
+        })?;
+        let vc = CString::new(v.as_str()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "env value contains NUL")
+        })?;
+        o.push((kc, vc));
     }
+    Ok(o)
+}
+
+pub fn setenv_cstr(key: &CStr, val: &CStr) -> std::io::Result<()> {
+    // SAFETY: both are valid C strings; setenv copies them.
+    let r = unsafe { libc::setenv(key.as_ptr(), val.as_ptr(), 1) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Empty this process's environment. Used in `pre_exec` so we can `setenv`
+/// extra + secrets and then `execv`, which inherits `environ`. `Command`'s
+/// `env_clear`/`env` build a separate envp for `execve` and ignore `setenv`.
+pub fn clear_environ() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: clearenv frees libc's environment array.
+        unsafe {
+            libc::clearenv();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        loop {
+            let first = {
+                // SAFETY: _NSGetEnviron is the Darwin environ pointer.
+                let p = unsafe { libc::_NSGetEnviron() };
+                if p.is_null() {
+                    return;
+                }
+                // SAFETY: p points at environ.
+                let env = unsafe { *p };
+                if env.is_null() {
+                    return;
+                }
+                // SAFETY: first slot is a C string or null.
+                let s = unsafe { *env };
+                if s.is_null() {
+                    return;
+                }
+                s
+            };
+            // SAFETY: first is a NUL-terminated NAME=value from environ.
+            let bytes = unsafe { CStr::from_ptr(first) }.to_bytes();
+            let name_len = bytes.iter().position(|b| *b == b'=').unwrap_or(bytes.len());
+            let Some(nameb) = bytes.get(..name_len) else {
+                return;
+            };
+            let Ok(name) = CString::new(nameb) else {
+                return;
+            };
+            // SAFETY: name is a valid C string we just copied.
+            unsafe {
+                libc::unsetenv(name.as_ptr());
+            }
+        }
+    }
+}
+
+/// Replace the environment with `extra` then `secrets`. Caller must not have
+/// used `Command::env_clear`/`env`: those make `execve` ignore `environ`.
+pub fn apply_child_env(extra: &[(CString, CString)], secrets: &SecretEnvC) -> std::io::Result<()> {
+    clear_environ();
+    for (k, v) in extra {
+        setenv_cstr(k, v)?;
+    }
+    install_secret_env(secrets)
 }
 
 pub fn getpid() -> u32 {
@@ -1230,6 +1311,7 @@ pub fn local_to_unix(
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn peer_cred_of_socketpair_is_us() {
@@ -1409,7 +1491,8 @@ mod tests {
 
     #[test]
     fn waitid_nowait_holds_zombie_until_reap() {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        // `/bin/true` does not exist in the Nix sandbox; `true` is on PATH.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         waitid_exited_nowait(pid).unwrap();
         let raw = i32::try_from(pid).unwrap();
@@ -1452,5 +1535,49 @@ mod tests {
         install_secret_env(&pairs).unwrap();
         assert_eq!(std::env::var("SB_TEST_ENV").unwrap(), "v");
         std::env::remove_var("SB_TEST_ENV");
+    }
+
+    #[test]
+    fn pre_exec_setenv_reaches_child_when_command_does_not_set_envp() {
+        let extra = str_env_c(&[("LANG".into(), "C".into())]).unwrap();
+        let secrets =
+            secret_env_c(&[("TOK".into(), Zeroizing::new(b"\xffsecret-bytes".to_vec()))]).unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "printf %s \"$TOK\""]);
+        // SAFETY: clearenv/setenv in the child; buffers live until spawn returns.
+        unsafe {
+            cmd.pre_exec(move || {
+                apply_child_env(&extra, &secrets)?;
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            out.stdout,
+            b"\xffsecret-bytes",
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn command_env_clear_discards_pre_exec_setenv() {
+        let secrets = secret_env_c(&[("TOK".into(), Zeroizing::new(b"secret".to_vec()))]).unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "printf %s \"${TOK:-missing}\""])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default());
+        // SAFETY: setenv in the child; this is the pattern spawn must not use.
+        unsafe {
+            cmd.pre_exec(move || {
+                install_secret_env(&secrets)?;
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            out.stdout, b"missing",
+            "std execve uses Command's envp; env_clear must not be used on profile spawn"
+        );
     }
 }

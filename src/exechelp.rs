@@ -261,11 +261,12 @@ fn spawn_one(
         std::ffi::CString::new(req.cwd.as_str()).map_err(|_| Error::msg("cwd contains NUL"))?;
     let uid = req.uid;
     let gid = req.gid;
-    let mut secret_env = sys::secret_env_c(secrets).map_err(Error::from)?;
+    let extra_c = sys::str_env_c(&req.extra_env).map_err(Error::from)?;
+    let secret_env = sys::secret_env_c(secrets).map_err(Error::from)?;
     let mut cmd = Command::new(&req.command);
+    // Do not env_clear/env: std then calls execve with its own envp and
+    // drops everything `setenv` wrote in pre_exec.
     cmd.args(&req.args)
-        .env_clear()
-        .envs(req.extra_env.iter().cloned())
         .process_group(0)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
@@ -275,8 +276,7 @@ fn spawn_one(
         cmd.pre_exec(move || {
             sys::apply_profile_creds(uid, gid)?;
             sys::chdir(&home_c)?;
-            sys::install_secret_env(&secret_env)?;
-            sys::wipe_secret_env(&mut secret_env);
+            sys::apply_child_env(&extra_c, &secret_env)?;
             let _ = sys::set_non_dumpable();
             let _ = sys::drop_all_caps();
             sys::close_from(3);
