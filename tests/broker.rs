@@ -202,6 +202,8 @@ impl Dialog {
         let mut s = send(sock, &req("prompter"), &[]);
         let r: Response = proto::read_json(&mut s, proto::T_JSON).unwrap();
         assert!(r.ok, "{}", r.error);
+        // Cooldown/missing-ready bugs otherwise block forever on the next prompt.
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         Dialog { s }
     }
     fn next(&mut self) -> Prompt {
@@ -210,6 +212,9 @@ impl Dialog {
     fn pin(&mut self, id: u64, pin: &[u8]) {
         proto::write_json(&mut self.s, proto::T_JSON, &Answer { kind: "pin".into(), id }).unwrap();
         proto::write_frame(&mut self.s, proto::T_PIN, pin).unwrap();
+    }
+    fn ready(&mut self, id: u64) {
+        proto::write_json(&mut self.s, proto::T_JSON, &Answer { kind: "ready".into(), id }).unwrap();
     }
     fn deny(&mut self, id: u64) {
         proto::write_json(&mut self.s, proto::T_JSON, &Answer { kind: "deny".into(), id }).unwrap();
@@ -307,6 +312,10 @@ fn states_pin_and_restricted_socket() {
     assert!(!dlg.next().ok);
     assert!(t.join().unwrap().unwrap_err().contains("denied"));
     assert_eq!(status(&main).state, "sealed");
+    // deny cooldown: a follow-up is refused without opening a dialog
+    let e = exec(&agent).unwrap_err();
+    assert!(e.contains("denied recently"), "{e}");
+    std::thread::sleep(Duration::from_secs(4));
 
     // Lockout: 3 wrong PINs wipe the secrets (back to gpg).
     let agent2 = agent.clone();
@@ -598,7 +607,7 @@ fn fido2_mock_touch() {
         &format!(
             "#!/bin/sh\nif [ \"$1\" = -G ]; then read cdh; read rp; read cred\n\
              [ \"$cred\" = Y3JlZA== ] || exit 1\n\
-             while [ ! -e {t} ]; do sleep 0.1; done\n\
+             while [ ! -e '{t}' ]; do sleep 0.1; done\n\
              printf '%s\\n%s\\nQVVUSA==\\nTU9DS1NJRw==\\n' \"$cdh\" \"$rp\"; exit 0; fi\n\
              if [ \"$1\" = -V ]; then read a; read b; read c; read sig; [ \"$sig\" = TU9DS1NJRw== ]; exit $?; fi\nexit 2\n",
             t = touch.display()
@@ -627,7 +636,9 @@ fn fido2_mock_touch() {
     let p = dlg.next();
     assert_eq!(p.methods, vec!["fido2"]);
     assert!(p.hints.iter().any(|h| h.contains("security key")));
-    std::thread::sleep(Duration::from_millis(300));
+    // FIDO2 is armed only after the UI is showing.
+    dlg.ready(p.id);
+    std::thread::sleep(Duration::from_millis(500));
     assert_eq!(status(&main).state, "sealed", "approved before the touch");
     std::fs::write(&touch, "").unwrap();
     let done = loop {
