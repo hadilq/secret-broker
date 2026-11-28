@@ -324,7 +324,9 @@ impl Audit {
             }
         };
         let hash = hash_line(line.as_bytes());
-        let len = u64::try_from(line.len()).unwrap_or(u64::MAX).saturating_add(1);
+        let len = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         let written = (|| -> Result<()> {
             self.ensure_file(&mut inner)?;
             if inner.size > 0 && inner.size.saturating_add(len) > self.cfg.max_file_bytes {
@@ -532,7 +534,8 @@ pub fn verify(lines: &[Line]) -> Verify {
         r.entries = r.entries.saturating_add(1);
         let hash = hash_line(l.raw.as_bytes());
         let Some(v) = &l.value else {
-            r.problems.push(format!("{at}: not valid JSON (truncated or edited)"));
+            r.problems
+                .push(format!("{at}: not valid JSON (truncated or edited)"));
             prev_hash = Some(hash);
             prev_seq = prev_seq.map(|s| s.saturating_add(1));
             continue;
@@ -557,7 +560,8 @@ pub fn verify(lines: &[Line]) -> Verify {
         }
         if let Some(ps) = prev_seq {
             if Some(seq) != ps.checked_add(1) {
-                r.problems.push(format!("{at}: seq jumps from {ps} to {seq}"));
+                r.problems
+                    .push(format!("{at}: seq jumps from {ps} to {seq}"));
             }
         }
         prev_seq = Some(seq);
@@ -585,9 +589,15 @@ pub fn cross_check(lines: &[Line], journal: &[(u64, String)]) -> Vec<String> {
     let mut problems = Vec::new();
     for (seq, h) in journal {
         match file.get(seq) {
-            Some(fh) if fh != h => problems.push(format!("seq {seq}: file entry differs from the journal's copy")),
-            None if *seq >= lo && *seq <= hi => problems.push(format!("seq {seq}: in the journal but missing from the file")),
-            None if *seq > hi => problems.push(format!("seq {seq}: in the journal, newer than the file's last entry (file truncated?)")),
+            Some(fh) if fh != h => problems.push(format!(
+                "seq {seq}: file entry differs from the journal's copy"
+            )),
+            None if *seq >= lo && *seq <= hi => problems.push(format!(
+                "seq {seq}: in the journal but missing from the file"
+            )),
+            None if *seq > hi => problems.push(format!(
+                "seq {seq}: in the journal, newer than the file's last entry (file truncated?)"
+            )),
             _ => {}
         }
     }
@@ -608,8 +618,13 @@ fn journal_hashes() -> Result<Vec<(u64, String)>> {
         .map_err(|e| Error::msg(format!("journalctl: {e}")))?;
     let mut v = Vec::new();
     for l in String::from_utf8_lossy(&out.stdout).lines() {
-        let Ok(j) = serde_json::from_str::<Value>(l) else { continue };
-        let seq = j.get("AUDIT_SEQ").and_then(Value::as_str).and_then(|s| s.parse().ok());
+        let Ok(j) = serde_json::from_str::<Value>(l) else {
+            continue;
+        };
+        let seq = j
+            .get("AUDIT_SEQ")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok());
         let h = j.get("AUDIT_HASH").and_then(Value::as_str);
         if let (Some(seq), Some(h)) = (seq, h) {
             v.push((seq, h.to_string()));
@@ -622,7 +637,9 @@ fn journal_hashes() -> Result<Vec<(u64, String)>> {
 pub fn parse_since(s: &str, now: i64) -> Result<i64> {
     let s = s.trim();
     if let Some(u) = s.strip_prefix('@') {
-        return u.parse().map_err(|_| Error::msg(format!("bad --since {s:?}")));
+        return u
+            .parse()
+            .map_err(|_| Error::msg(format!("bad --since {s:?}")));
     }
     let unit = s.chars().last().unwrap_or(' ');
     let mult: Option<i64> = match unit {
@@ -645,8 +662,10 @@ pub fn parse_since(s: &str, now: i64) -> Result<i64> {
     let d: Vec<i32> = date.split('-').filter_map(|x| x.parse().ok()).collect();
     let t: Vec<i32> = time.split(':').filter_map(|x| x.parse().ok()).collect();
     match (d.as_slice(), t.as_slice()) {
-        ([y, mo, da], [h, mi, rest @ ..]) => crate::sys::local_to_unix(*y, *mo, *da, *h, *mi, rest.first().copied().unwrap_or(0))
-            .ok_or_else(|| Error::msg(format!("bad --since {s:?}"))),
+        ([y, mo, da], [h, mi, rest @ ..]) => {
+            crate::sys::local_to_unix(*y, *mo, *da, *h, *mi, rest.first().copied().unwrap_or(0))
+                .ok_or_else(|| Error::msg(format!("bad --since {s:?}")))
+        }
         _ => bail!("bad --since {s:?} (use 2h, 3d, 2026-11-22, '2026-11-22 09:00' or @UNIX)"),
     }
 }
@@ -666,7 +685,11 @@ impl Filter {
         }
         if !self.events.is_empty() {
             let e = gs(v, "event");
-            if !self.events.iter().any(|x| x == e || (x.ends_with('*') && e.starts_with(x.trim_end_matches('*')))) {
+            if !self
+                .events
+                .iter()
+                .any(|x| x == e || (x.ends_with('*') && e.starts_with(x.trim_end_matches('*'))))
+            {
                 return false;
             }
         }
@@ -681,9 +704,15 @@ fn print_line(l: &Line, json: bool, out: &mut impl Write) -> std::io::Result<()>
     match &l.value {
         Some(v) => {
             let ms = v.get("ts_unix_ms").and_then(Value::as_u64).unwrap_or(0);
-            let t = crate::sys::local_time(i64::try_from(ms.checked_div(1000).unwrap_or(0)).unwrap_or(0));
+            let t = crate::sys::local_time(
+                i64::try_from(ms.checked_div(1000).unwrap_or(0)).unwrap_or(0),
+            );
             let seq = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            writeln!(out, "{t}  #{seq:<5} {}", crate::server::sanitize(&summary(v), 2000))
+            writeln!(
+                out,
+                "{t}  #{seq:<5} {}",
+                crate::server::sanitize(&summary(v), 2000)
+            )
         }
         None => writeln!(out, "(unparseable line {}:{})", l.file.display(), l.lineno),
     }
@@ -713,7 +742,9 @@ pub fn cli(args: &[String]) -> Result<u8> {
             "--json" => json = true,
             "-f" | "--follow" => follow = true,
             "--journal" => with_journal = true,
-            "--dir" => dir = PathBuf::from(it.next().ok_or_else(|| Error::msg("--dir needs a path"))?),
+            "--dir" => {
+                dir = PathBuf::from(it.next().ok_or_else(|| Error::msg("--dir needs a path"))?)
+            }
             "-n" | "--lines" => {
                 last = Some(
                     it.next()
@@ -722,12 +753,16 @@ pub fn cli(args: &[String]) -> Result<u8> {
                 )
             }
             "--since" => {
-                let s = it.next().ok_or_else(|| Error::msg("--since needs a value"))?;
+                let s = it
+                    .next()
+                    .ok_or_else(|| Error::msg("--since needs a value"))?;
                 let t = parse_since(s, crate::sys::now_unix_i64())?;
                 filter.since_ms = Some(u64::try_from(t).unwrap_or(0).saturating_mul(1000));
             }
             "--event" => {
-                let e = it.next().ok_or_else(|| Error::msg("--event needs a name"))?;
+                let e = it
+                    .next()
+                    .ok_or_else(|| Error::msg("--event needs a name"))?;
                 filter.events.extend(e.split(',').map(str::to_string));
             }
             other => bail!("log: unknown option {other}"),
@@ -865,9 +900,17 @@ mod tests {
             ..Default::default()
         };
         for i in 0..12 {
-            a.record(Event::new("exec_end", "ok").caller(&c).field("exit_code", i));
+            a.record(
+                Event::new("exec_end", "ok")
+                    .caller(&c)
+                    .field("exit_code", i),
+            );
         }
-        let mode = std::fs::metadata(d.join(FILE)).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(d.join(FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o640);
         assert!(files_oldest_first(&d).len() >= 3, "rotated");
         assert!(files_oldest_first(&d).len() <= 4, "keep 3 + current");
@@ -903,10 +946,19 @@ mod tests {
         }
         let cur = d2.join(FILE);
         let text = std::fs::read_to_string(&cur).unwrap();
-        let kept: Vec<&str> = text.lines().enumerate().filter(|(i, _)| *i != 1).map(|(_, l)| l).collect();
+        let kept: Vec<&str> = text
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| l)
+            .collect();
         std::fs::write(&cur, kept.join("\n") + "\n").unwrap();
         let r = verify(&read_all(&d2).unwrap());
-        assert!(r.problems.iter().any(|p| p.contains("prev hash")), "{:?}", r.problems);
+        assert!(
+            r.problems.iter().any(|p| p.contains("prev hash")),
+            "{:?}",
+            r.problems
+        );
         assert!(r.problems.iter().any(|p| p.contains("seq jumps")));
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&d2);
@@ -922,7 +974,12 @@ mod tests {
         let lines = read_all(&d).unwrap();
         let j: Vec<(u64, String)> = lines
             .iter()
-            .map(|l| (l.value.as_ref().unwrap()["seq"].as_u64().unwrap(), hash_line(l.raw.as_bytes())))
+            .map(|l| {
+                (
+                    l.value.as_ref().unwrap()["seq"].as_u64().unwrap(),
+                    hash_line(l.raw.as_bytes()),
+                )
+            })
             .collect();
         assert!(cross_check(&lines, &j).is_empty());
         let mut bad = j.clone();
@@ -954,7 +1011,10 @@ mod tests {
         let v = serde_json::json!({"event":"exec_end","outcome":"ok","profile":"gh","args":["pr","list"],"exit_code":0,
             "caller":{"user":"hadi","pid":7,"argv":["secret-run","gh"],"app":"foot (via Hyprland)","socket":"agent.sock","ai_run_profile":"grok-bot"}});
         let s = summary(&v);
-        assert!(s.contains("exec_end ok profile=gh args=[pr list] exit=0 by hadi pid 7"), "{s}");
+        assert!(
+            s.contains("exec_end ok profile=gh args=[pr list] exit=0 by hadi pid 7"),
+            "{s}"
+        );
         assert!(s.contains("ai-run=grok-bot"));
     }
 }

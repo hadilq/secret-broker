@@ -34,7 +34,9 @@ impl Editor {
 
     /// Characters before the cursor.
     pub fn cursor_chars(&self) -> usize {
-        self.text.get(..self.cursor).map_or(0, |s| s.chars().count())
+        self.text
+            .get(..self.cursor)
+            .map_or(0, |s| s.chars().count())
     }
 
     /// Hand the text over (Enter) and start empty.
@@ -60,7 +62,10 @@ impl Editor {
     }
 
     fn prev(&self, at: usize) -> usize {
-        self.text.get(..at).and_then(|s| s.char_indices().next_back()).map_or(0, |(i, _)| i)
+        self.text
+            .get(..at)
+            .and_then(|s| s.char_indices().next_back())
+            .map_or(0, |(i, _)| i)
     }
 
     fn next(&self, at: usize) -> usize {

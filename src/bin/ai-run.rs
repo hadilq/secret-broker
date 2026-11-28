@@ -260,10 +260,12 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // bubblewrap is Linux-only. Refuse rather than run the agent unsandboxed;
     // a macOS backend (sandbox-exec / Seatbelt profile) is not written yet.
-    if !cfg!(target_os = "linux") && !args
+    if !cfg!(target_os = "linux")
+        && !args
             .iter()
             .take_while(|a| *a != "--")
-            .any(|a| a == "--print" || a == "--list") {
+            .any(|a| a == "--print" || a == "--list")
+    {
         eprintln!("ai-run: not supported on this OS yet (needs bubblewrap; a macOS sandbox-exec backend is planned). Refusing to run unsandboxed.");
         return ExitCode::from(125);
     }

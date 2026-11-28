@@ -958,8 +958,11 @@ impl Server {
             );
         }
         let ch = Arc::new(Channel::new(stream, caller.uid, caller.pid)?);
-        proto::write_json(stream, proto::T_JSON, &ok_response())?;
+        // Publish before the ok reply. The client may call `status` as soon as
+        // it sees ok (the macOS tests do); replacing after the write leaves a
+        // window where `prompter` is still false.
         let old = lock_any(&self.prompter).replace(ch);
+        proto::write_json(stream, proto::T_JSON, &ok_response())?;
         self.audit(
             Event::new("prompter_register", "ok")
                 .caller(caller)

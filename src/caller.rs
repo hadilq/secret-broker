@@ -100,12 +100,20 @@ pub fn parse_stat(text: &str) -> Option<Stat> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
     let comm = text.get(open.checked_add(1)?..close)?;
-    let rest: Vec<&str> = text.get(close.checked_add(1)?..)?.split_whitespace().collect();
+    let rest: Vec<&str> = text
+        .get(close.checked_add(1)?..)?
+        .split_whitespace()
+        .collect();
     // rest[0] is field 3 (state): field n is rest[n - 3].
     Some(Stat {
         comm: clean(comm, 32),
         ppid: rest.get(1)?.parse().ok()?,
-        tty_nr: rest.get(4)?.parse::<i64>().ok().and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+        tty_nr: rest
+            .get(4)?
+            .parse::<i64>()
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0),
         start_time: rest.get(19)?.parse().ok()?,
     })
 }
@@ -216,7 +224,9 @@ fn kv_file(path: &Path) -> HashMap<String, String> {
 }
 
 fn safe_id(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// /dev name of a tty_nr from /proc/<pid>/stat.
@@ -248,7 +258,10 @@ fn ai_run_profile(argv: &[String]) -> Option<String> {
 }
 
 fn is_bwrap(comm: &str, argv: &[String]) -> bool {
-    comm == "bwrap" || argv.first().is_some_and(|a| a.ends_with("/bwrap") || a == "bwrap")
+    comm == "bwrap"
+        || argv
+            .first()
+            .is_some_and(|a| a.ends_with("/bwrap") || a == "bwrap")
 }
 
 /// Snapshot of `pid` (uid/user/socket are filled in by the broker).
@@ -292,8 +305,9 @@ pub fn collect(r: &Roots, pid: i32) -> Caller {
     while cur > 0 && c.parents.len() < MAX_PARENTS {
         let Some(ps) = stat(r, cur) else { break };
         if ps.start_time > child_start {
-            c.notes
-                .push(format!("parent pid {cur} started after its child (pid reused); chain cut"));
+            c.notes.push(format!(
+                "parent pid {cur} started after its child (pid reused); chain cut"
+            ));
             break;
         }
         let pargv = read_argv(r, cur);
@@ -396,7 +410,10 @@ pub fn parse_procargs(buf: &[u8]) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 mod darwin {
-    use super::{app_bundle, clean, clip, darwin_tty_name, parse_procargs, MAX_ARG, MAX_ARGS, MAX_PARENTS, MAX_PARENT_ARG, MAX_PARENT_ARGS};
+    use super::{
+        app_bundle, clean, clip, darwin_tty_name, parse_procargs, MAX_ARG, MAX_ARGS, MAX_PARENTS,
+        MAX_PARENT_ARG, MAX_PARENT_ARGS,
+    };
     use crate::proto::{Caller, ProcInfo};
     use std::mem::size_of;
     use zeroize::Zeroizing;
@@ -437,7 +454,11 @@ mod darwin {
             return None;
         }
         let name = c_chars(&info.pbi_name);
-        let comm = if name.is_empty() { c_chars(&info.pbi_comm) } else { name };
+        let comm = if name.is_empty() {
+            c_chars(&info.pbi_comm)
+        } else {
+            name
+        };
         Some(Bsd {
             comm: clean(&comm, 32),
             ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
@@ -558,8 +579,9 @@ mod darwin {
         while cur > 0 && c.parents.len() < MAX_PARENTS {
             let Some(ps) = bsd(cur) else { break };
             if ps.start > child_start {
-                c.notes
-                    .push(format!("parent pid {cur} started after its child (pid reused); chain cut"));
+                c.notes.push(format!(
+                    "parent pid {cur} started after its child (pid reused); chain cut"
+                ));
                 break;
             }
             let pexe = exe(cur);
@@ -705,17 +727,33 @@ mod tests {
             Some(("grok-bot".into(), "".into()))
         );
         assert_eq!(parse_app_unit("session-2.scope"), None);
-        let (u, a, l) = unit_of("/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-foot-99.scope");
-        assert_eq!((u.as_str(), a.as_str(), l.as_str()), ("app-Hyprland-foot-99.scope", "foot", "Hyprland"));
-        assert_eq!(session_of_cgroup("/user.slice/user-1000.slice/session-3.scope"), Some("3".into()));
+        let (u, a, l) = unit_of(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-foot-99.scope",
+        );
+        assert_eq!(
+            (u.as_str(), a.as_str(), l.as_str()),
+            ("app-Hyprland-foot-99.scope", "foot", "Hyprland")
+        );
+        assert_eq!(
+            session_of_cgroup("/user.slice/user-1000.slice/session-3.scope"),
+            Some("3".into())
+        );
     }
 
     #[test]
     fn bwrap_profile() {
-        let a: Vec<String> = ["bwrap", "--die-with-parent", "--setenv", "AI_RUN_PROFILE", "grok-bot", "--", "sh"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let a: Vec<String> = [
+            "bwrap",
+            "--die-with-parent",
+            "--setenv",
+            "AI_RUN_PROFILE",
+            "grok-bot",
+            "--",
+            "sh",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         assert_eq!(ai_run_profile(&a), Some("grok-bot".into()));
         assert!(is_bwrap("bwrap", &a));
     }
@@ -725,7 +763,10 @@ mod tests {
         assert_eq!(darwin_tty_name((16 << 24) | 3), "/dev/ttys003");
         assert_eq!(darwin_tty_name(0), "");
         assert_eq!(darwin_tty_name(u32::MAX), "");
-        assert_eq!(app_bundle("/Applications/iTerm.app/Contents/MacOS/iTerm2"), Some("iTerm".into()));
+        assert_eq!(
+            app_bundle("/Applications/iTerm.app/Contents/MacOS/iTerm2"),
+            Some("iTerm".into())
+        );
         assert_eq!(
             app_bundle("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper"),
             Some("Visual Studio Code".into())
@@ -736,7 +777,9 @@ mod tests {
     #[test]
     fn procargs_parsing() {
         let mut b = 3i32.to_ne_bytes().to_vec();
-        b.extend_from_slice(b"/bin/secret-run\0\0\0\0secret-run\0gh\0pr list\0HOME=/Users/h\0TOKEN=s3cret\0");
+        b.extend_from_slice(
+            b"/bin/secret-run\0\0\0\0secret-run\0gh\0pr list\0HOME=/Users/h\0TOKEN=s3cret\0",
+        );
         assert_eq!(parse_procargs(&b), vec!["secret-run", "gh", "pr list"]);
         assert!(parse_procargs(&[1, 0]).is_empty());
     }
@@ -781,17 +824,37 @@ mod tests {
             std::fs::write(p.join("status"), "Name:\tx\nUid:\t1000\t1000\t1000\t1000\n").unwrap();
             std::fs::write(p.join("sessionid"), "4294967295").unwrap();
         };
-        let cg = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-foot-7.scope";
-        mk(30, "30 (secret-run) S 20 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 300 0 0", b"secret-run\0gh\0pr\0list\0", cg);
-        mk(20, "20 (bwrap) S 10 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 200 0 0", b"/nix/store/x-bubblewrap/bin/bwrap\0--setenv\0AI_RUN_PROFILE\0grok-bot\0--\0zsh\0", cg);
+        let cg =
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-foot-7.scope";
+        mk(
+            30,
+            "30 (secret-run) S 20 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 300 0 0",
+            b"secret-run\0gh\0pr\0list\0",
+            cg,
+        );
+        mk(
+            20,
+            "20 (bwrap) S 10 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 200 0 0",
+            b"/nix/store/x-bubblewrap/bin/bwrap\0--setenv\0AI_RUN_PROFILE\0grok-bot\0--\0zsh\0",
+            cg,
+        );
         // pid 10 was reused: it started after pid 20
-        mk(10, "10 (zsh) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 900 0 0", b"zsh\0", cg);
+        mk(
+            10,
+            "10 (zsh) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 900 0 0",
+            b"zsh\0",
+            cg,
+        );
         let users = d.join("run/systemd/users");
         std::fs::create_dir_all(&users).unwrap();
         std::fs::write(users.join("1000"), "NAME=hadi\nDISPLAY=2\n").unwrap();
         let sessions = d.join("run/systemd/sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(sessions.join("2"), "SEAT=seat0\nTTY=tty1\nTYPE=wayland\nCLASS=user\n").unwrap();
+        std::fs::write(
+            sessions.join("2"),
+            "SEAT=seat0\nTTY=tty1\nTYPE=wayland\nCLASS=user\n",
+        )
+        .unwrap();
         let r = Roots {
             proc: d.join("proc"),
             run: d.join("run"),
@@ -802,7 +865,11 @@ mod tests {
         assert_eq!(c.app_label(), "foot (via Hyprland)");
         assert_eq!(c.ai_run_profile, "grok-bot");
         assert_eq!(c.parents.len(), 1);
-        assert!(c.notes.iter().any(|n| n.contains("pid reused")), "{:?}", c.notes);
+        assert!(
+            c.notes.iter().any(|n| n.contains("pid reused")),
+            "{:?}",
+            c.notes
+        );
         assert_eq!(c.login_session, "2");
         assert_eq!(c.seat, "seat0");
         assert_eq!(c.tty, "tty1");

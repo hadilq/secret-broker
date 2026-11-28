@@ -804,11 +804,7 @@ mod tests {
         );
         assert!(has(
             a,
-            &[
-                "--ro-bind",
-                &sock.to_string_lossy(),
-                "/run/user/1000/bus"
-            ]
+            &["--ro-bind", &sock.to_string_lossy(), "/run/user/1000/bus"]
         ));
         let get = |k: &str| p.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         // a profile's env wins over the global env

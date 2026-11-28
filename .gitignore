@@ -1,4 +1,5 @@
 /result
+/vm-result
 /result-*
 *.test
 /target

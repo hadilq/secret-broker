@@ -104,7 +104,10 @@ fn start(name: &str, extra: serde_json::Value) -> Option<Daemon> {
     let d = Daemon { child, dir };
     let start = Instant::now();
     while !d.agent_sock().exists() {
-        assert!(start.elapsed() < Duration::from_secs(10), "daemon did not start");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon did not start"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     Some(d)
@@ -211,20 +214,46 @@ impl Dialog {
         proto::read_json(&mut self.s, proto::T_JSON).unwrap()
     }
     fn pin(&mut self, id: u64, pin: &[u8]) {
-        proto::write_json(&mut self.s, proto::T_JSON, &Answer { kind: "pin".into(), id }).unwrap();
+        proto::write_json(
+            &mut self.s,
+            proto::T_JSON,
+            &Answer {
+                kind: "pin".into(),
+                id,
+            },
+        )
+        .unwrap();
         proto::write_frame(&mut self.s, proto::T_PIN, pin).unwrap();
     }
     fn ready(&mut self, id: u64) {
-        proto::write_json(&mut self.s, proto::T_JSON, &Answer { kind: "ready".into(), id }).unwrap();
+        proto::write_json(
+            &mut self.s,
+            proto::T_JSON,
+            &Answer {
+                kind: "ready".into(),
+                id,
+            },
+        )
+        .unwrap();
     }
     fn deny(&mut self, id: u64) {
-        proto::write_json(&mut self.s, proto::T_JSON, &Answer { kind: "deny".into(), id }).unwrap();
+        proto::write_json(
+            &mut self.s,
+            proto::T_JSON,
+            &Answer {
+                kind: "deny".into(),
+                id,
+            },
+        )
+        .unwrap();
     }
 }
 
 #[test]
 fn states_pin_and_restricted_socket() {
-    let Some(d) = start("pin", serde_json::json!({})) else { return };
+    let Some(d) = start("pin", serde_json::json!({})) else {
+        return;
+    };
     let (main, agent) = (d.main_sock(), d.agent_sock());
     let key = data_key();
 
@@ -239,7 +268,10 @@ fn states_pin_and_restricted_socket() {
     assert_eq!(exec_args(&agent, &["--token=tok-123456"]).unwrap(), "ran\n");
     let st = status(&main);
     let owner = st.session.as_ref().unwrap().unlocked.as_ref().unwrap();
-    assert_eq!((owner.method.as_str(), owner.socket.as_str()), ("gpg", "broker.sock"));
+    assert_eq!(
+        (owner.method.as_str(), owner.socket.as_str()),
+        ("gpg", "broker.sock")
+    );
     assert!(call(&main, &req("lock"), &[]).ok);
     assert_eq!(status(&main).state, "cold");
 
@@ -259,7 +291,10 @@ fn states_pin_and_restricted_socket() {
     let st = status(&main);
     assert_eq!((st.state.as_str(), st.pin_set), ("open", true));
     assert_eq!(st.methods, vec!["pin"]);
-    let mode = std::fs::metadata(d.dir.join("state/auth/pin")).unwrap().permissions().mode();
+    let mode = std::fs::metadata(d.dir.join("state/auth/pin"))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600);
     // Too-short PIN refused.
     let r = call(
@@ -276,7 +311,8 @@ fn states_pin_and_restricted_socket() {
 
     // Dialog approves with the PIN (after one wrong try).
     let mut dlg = Dialog::register(&main);
-    assert!(status(&main).prompter);
+    let st = status(&main);
+    assert!(st.prompter, "{st:?}");
     let agent2 = agent.clone();
     let t = std::thread::spawn(move || exec(&agent2));
     let p = dlg.next();
@@ -288,7 +324,10 @@ fn states_pin_and_restricted_socket() {
     let c = p.caller.as_ref().unwrap();
     assert!(c.sandboxed && c.socket == "agent.sock");
     assert!(c.verified, "{:?}", c.notes);
-    assert!(!c.exe.is_empty() && !c.cwd.is_empty() && !c.argv.is_empty(), "{c:?}");
+    assert!(
+        !c.exe.is_empty() && !c.cwd.is_empty() && !c.argv.is_empty(),
+        "{c:?}"
+    );
     assert!(!c.parents.is_empty());
     let sess = p.session.as_ref().unwrap();
     assert_eq!(sess.state, "sealed");
@@ -343,16 +382,30 @@ fn states_pin_and_restricted_socket() {
     // gpg again resets; lock --forget wipes even with a PIN set.
     assert!(call(&main, &req("unlock"), &[(proto::T_KEY, &key)]).ok);
     assert!(!status(&main).pin_locked_out);
-    assert!(call(&main, &Request { op: "lock".into(), forget: true, ..Default::default() }, &[]).ok);
+    assert!(
+        call(
+            &main,
+            &Request {
+                op: "lock".into(),
+                forget: true,
+                ..Default::default()
+            },
+            &[]
+        )
+        .ok
+    );
     assert_eq!(status(&main).state, "cold");
     drop(dlg);
     // Client-side events (fido2-enroll) can be reported, not from a sandbox.
     let rep = Request {
         op: "report".into(),
         event: "fido2_enroll".into(),
-        details: [("name".to_string(), "yubikey".to_string()), ("credential_id".to_string(), "Y3JlZA==".to_string())]
-            .into_iter()
-            .collect(),
+        details: [
+            ("name".to_string(), "yubikey".to_string()),
+            ("credential_id".to_string(), "Y3JlZA==".to_string()),
+        ]
+        .into_iter()
+        .collect(),
         ..Default::default()
     };
     assert!(call(&main, &rep, &[]).ok);
@@ -385,17 +438,15 @@ fn trusted_prompter_exe_still_gets_the_phrase() {
         .and_then(|p| std::fs::canonicalize(p).ok())
         .map(|p| p.to_string_lossy().into_owned());
     let Some(me) = me else { return };
-    let Some(d) = start(
-        "prompter-ok",
-        serde_json::json!({"prompter_exe": me}),
-    ) else {
+    let Some(d) = start("prompter-ok", serde_json::json!({"prompter_exe": me})) else {
         return;
     };
     let (main, agent) = (d.main_sock(), d.agent_sock());
     set_pin(&d, b"2468");
     assert!(call(&main, &req("lock"), &[]).ok);
     let mut dlg = Dialog::register(&main);
-    assert!(status(&main).prompter);
+    let st = status(&main);
+    assert!(st.prompter, "{st:?}");
     let t = std::thread::spawn(move || exec(&agent));
     let p = dlg.next();
     assert_eq!(p.kind, "request");
@@ -442,7 +493,10 @@ fn deny_tokens_refuse_exec_even_with_globstar_allow() {
     let d = Daemon { child, dir };
     let start = Instant::now();
     while !d.agent_sock().exists() {
-        assert!(start.elapsed() < Duration::from_secs(10), "daemon did not start");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon did not start"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let (main, agent) = (d.main_sock(), d.agent_sock());
@@ -495,7 +549,10 @@ fn exec_timeout_kills_the_child() {
     let d = Daemon { child, dir };
     let start = Instant::now();
     while !d.agent_sock().exists() {
-        assert!(start.elapsed() < Duration::from_secs(10), "daemon did not start");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon did not start"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let (main, agent) = (d.main_sock(), d.agent_sock());
@@ -503,8 +560,15 @@ fn exec_timeout_kills_the_child() {
     assert!(call(&main, &req("unlock"), &[(proto::T_KEY, &key)]).ok);
     let t0 = Instant::now();
     let e = exec_profile(&agent, "nap", &["30"]).unwrap_err();
-    assert!(t0.elapsed() < Duration::from_secs(8), "{e} {:?}", t0.elapsed());
-    assert!(e.contains("timeout") || e.contains("137") || e.contains("killed"), "{e}");
+    assert!(
+        t0.elapsed() < Duration::from_secs(8),
+        "{e} {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        e.contains("timeout") || e.contains("137") || e.contains("killed"),
+        "{e}"
+    );
 }
 
 fn check_audit(d: &Daemon) {
@@ -514,37 +578,49 @@ fn check_audit(d: &Daemon) {
     let r = audit::verify(&lines);
     assert!(r.problems.is_empty(), "{:?}", r.problems);
     assert_eq!(r.first_seq, 1);
-    let mode = std::fs::metadata(dir.join(audit::FILE)).unwrap().permissions().mode();
+    let mode = std::fs::metadata(dir.join(audit::FILE))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o640);
     let raw: String = lines.iter().map(|l| l.raw.clone() + "\n").collect();
     assert!(!raw.contains("tok-123456"), "secret value in the audit log");
     assert!(raw.contains("--token=[REDACTED]"));
     let has = |event: &str, outcome: &str, extra: &dyn Fn(&serde_json::Value) -> bool| {
-        lines.iter().filter_map(|l| l.value.as_ref()).any(|v| {
-            v["event"] == event && v["outcome"] == outcome && extra(v)
-        })
+        lines
+            .iter()
+            .filter_map(|l| l.value.as_ref())
+            .any(|v| v["event"] == event && v["outcome"] == outcome && extra(v))
     };
     let any = |_: &serde_json::Value| true;
     assert!(has("broker_start", "ok", &any));
-    assert!(has("unlock", "ok", &|v| v["method"] == "gpg" && v["caller"]["socket"] == "broker.sock"));
+    assert!(has("unlock", "ok", &|v| v["method"] == "gpg"
+        && v["caller"]["socket"] == "broker.sock"));
     assert!(has("unlock", "failed", &any));
-    assert!(has("unlock", "refused", &|v| v["caller"]["socket"] == "agent.sock"));
+    assert!(has("unlock", "refused", &|v| v["caller"]["socket"]
+        == "agent.sock"));
     assert!(has("set_pin", "refused", &any));
     assert!(has("prompter_register", "refused", &any));
     assert!(has("set_pin", "ok", &any));
     assert!(has("set_pin", "failed", &any));
-    assert!(has("exec", "refused", &|v| v["reason"].as_str().unwrap_or("").contains("not in memory")));
+    assert!(has("exec", "refused", &|v| v["reason"]
+        .as_str()
+        .unwrap_or("")
+        .contains("not in memory")));
     assert!(has("exec_start", "started", &|v| v["profile"] == "echo"));
-    assert!(has("exec_end", "ok", &|v| v["exit_code"] == 0 && v["duration_ms"].is_u64()));
+    assert!(has("exec_end", "ok", &|v| v["exit_code"] == 0
+        && v["duration_ms"].is_u64()));
     assert!(has("lock", "wiped", &|v| v["forget"] == false));
     assert!(has("lock", "wiped", &|v| v["forget"] == true));
     assert!(has("lock", "sealed", &any));
     assert!(has("prompter_register", "ok", &any));
-    assert!(has("approval", "granted", &|v| v["method"] == "pin" && v["via"] == "dialog"));
+    assert!(has("approval", "granted", &|v| v["method"] == "pin"
+        && v["via"] == "dialog"));
     assert!(has("approval", "denied", &any));
     assert!(has("pin_wrong", "failed", &any));
     assert!(has("pin_lockout", "wiped", &any));
-    assert!(has("fido2_enroll", "reported", &|v| v["name"] == "yubikey" && v["credential_id"] == "Y3JlZA=="));
+    assert!(has("fido2_enroll", "reported", &|v| v["name"] == "yubikey"
+        && v["credential_id"] == "Y3JlZA=="));
     assert!(has("report", "refused", &any));
     // Caller details from the /proc helper.
     assert!(has("exec_end", "ok", &|v| {
@@ -556,29 +632,59 @@ fn check_audit(d: &Daemon) {
     }));
     // `secret-broker log` and `log verify` on it.
     let bin = env!("CARGO_BIN_EXE_secret-broker");
-    let out = Command::new(bin).args(["log", "--dir"]).arg(&dir).args(["--event", "approval"]).output().unwrap();
+    let out = Command::new(bin)
+        .args(["log", "--dir"])
+        .arg(&dir)
+        .args(["--event", "approval"])
+        .output()
+        .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && text.contains("approval granted method=pin"), "{text}");
+    assert!(
+        out.status.success() && text.contains("approval granted method=pin"),
+        "{text}"
+    );
     assert!(!text.contains("exec_end"));
-    let out = Command::new(bin).args(["log", "verify", "--dir"]).arg(&dir).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let out = Command::new(bin)
+        .args(["log", "verify", "--dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     // Tampering is detected.
     let f = dir.join(audit::FILE);
     let t = std::fs::read_to_string(&f).unwrap();
-    std::fs::write(&f, t.replacen("\"outcome\":\"denied\"", "\"outcome\":\"granted\"", 1)).unwrap();
-    let out = Command::new(bin).args(["log", "verify", "--dir"]).arg(&dir).output().unwrap();
+    std::fs::write(
+        &f,
+        t.replacen("\"outcome\":\"denied\"", "\"outcome\":\"granted\"", 1),
+    )
+    .unwrap();
+    let out = Command::new(bin)
+        .args(["log", "verify", "--dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
     assert!(!out.status.success());
 }
 
 #[test]
 fn ttl_expiry_seals() {
-    let Some(d) = start("ttl", serde_json::json!({})) else { return };
+    let Some(d) = start("ttl", serde_json::json!({})) else {
+        return;
+    };
     let main = d.main_sock();
     set_pin(&d, b"1357");
     let key = data_key();
     let r = call(
         &main,
-        &Request { op: "unlock".into(), ttl_seconds: Some(1), ..Default::default() },
+        &Request {
+            op: "unlock".into(),
+            ttl_seconds: Some(1),
+            ..Default::default()
+        },
         &[(proto::T_KEY, &key)],
     );
     assert!(r.ok);
@@ -617,7 +723,11 @@ fn fido2_mock_touch() {
         ),
     );
     let pk = tools.join("pk.pem");
-    std::fs::write(&pk, "-----BEGIN PUBLIC KEY-----\nmock\n-----END PUBLIC KEY-----\n").unwrap();
+    std::fs::write(
+        &pk,
+        "-----BEGIN PUBLIC KEY-----\nmock\n-----END PUBLIC KEY-----\n",
+    )
+    .unwrap();
     let Some(d) = start(
         "fido2",
         serde_json::json!({"fido2": {"tools_dir": tools, "credentials": [
@@ -632,7 +742,10 @@ fn fido2_mock_touch() {
     assert!(call(&main, &req("unlock"), &[(proto::T_KEY, &key)]).ok);
     assert!(call(&main, &req("lock"), &[]).ok);
     let st = status(&main);
-    assert_eq!((st.state.as_str(), st.methods.clone()), ("sealed", vec!["fido2".to_string()]));
+    assert_eq!(
+        (st.state.as_str(), st.methods.clone()),
+        ("sealed", vec!["fido2".to_string()])
+    );
 
     let mut dlg = Dialog::register(&main);
     let t = std::thread::spawn(move || exec(&agent));

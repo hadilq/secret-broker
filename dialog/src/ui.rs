@@ -23,8 +23,8 @@ use crate::theme::{Rgb, Theme};
 use smithay_client_toolkit::reexports::client::{
     globals::registry_queue_init,
     protocol::{
-        wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_keyboard, wl_output, wl_seat, wl_shm,
-        wl_surface,
+        wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_keyboard, wl_output,
+        wl_seat, wl_shm, wl_surface,
     },
     Connection, EventQueue, QueueHandle,
 };
@@ -65,7 +65,12 @@ pub const MAX_PASTE: usize = 4096;
 /// Give up on a clipboard owner that doesn't answer.
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Clipboard types we accept, best first.
-const TEXT_MIMES: [&str; 4] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"];
+const TEXT_MIMES: [&str; 4] = [
+    "text/plain;charset=utf-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -183,7 +188,9 @@ fn dot_window(len: usize, cursor: usize, cap: usize) -> (usize, usize) {
 
 /// Pick the clipboard type to ask for.
 fn pick_mime(offered: &[String]) -> Option<&'static str> {
-    TEXT_MIMES.into_iter().find(|m| offered.iter().any(|o| o.eq_ignore_ascii_case(m)))
+    TEXT_MIMES
+        .into_iter()
+        .find(|m| offered.iter().any(|o| o.eq_ignore_ascii_case(m)))
 }
 
 /// Clipboard bytes to the text to insert: UTF-8, trailing newlines dropped,
@@ -200,7 +207,6 @@ fn clean_paste(bytes: &[u8]) -> Result<&str, &'static str> {
     Ok(text)
 }
 
-
 pub struct Ui {
     _conn: Connection,
     queue: EventQueue<App>,
@@ -214,16 +220,24 @@ impl Ui {
         let zoom = clamp_size(size);
         let (w0, h0) = (zoomed(W as f32, zoom), zoomed(300.0, zoom));
         let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
-        let (globals, queue) = registry_queue_init::<App>(&conn).map_err(|e| format!("wayland: {e}"))?;
+        let (globals, queue) =
+            registry_queue_init::<App>(&conn).map_err(|e| format!("wayland: {e}"))?;
         let qh = queue.handle();
-        let compositor = CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
+        let compositor =
+            CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
         let layer_shell = LayerShell::bind(&globals, &qh)
             .map_err(|e| format!("this compositor has no wlr-layer-shell: {e}"))?;
         let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
         // Optional: without it there's just no paste.
         let data_devices = DataDeviceManagerState::bind(&globals, &qh).ok();
         let surface = compositor.create_surface(&qh);
-        let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("secret-broker"), None);
+        let layer = layer_shell.create_layer_surface(
+            &qh,
+            surface,
+            Layer::Overlay,
+            Some("secret-broker"),
+            None,
+        );
         // No anchor: compositors center the surface.
         // OnDemand, not Exclusive: other windows stay usable (compositors
         // focus an Overlay on-demand surface when it maps, and on click).
@@ -231,7 +245,8 @@ impl Ui {
         layer.set_exclusive_zone(-1);
         layer.set_size(w0, h0);
         layer.commit();
-        let pool = SlotPool::new((w0 * h0 * 4) as usize, &shm).map_err(|e| format!("shm pool: {e}"))?;
+        let pool =
+            SlotPool::new((w0 * h0 * 4) as usize, &shm).map_err(|e| format!("shm pool: {e}"))?;
         let app = App {
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
@@ -320,15 +335,18 @@ impl Ui {
             let timeout = if paste_fd.is_some() { 100 } else { 1000 };
             // SAFETY: fds is a valid array of pollfd for the duration of the call.
             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
-            let ready = |fd: Option<RawFd>| fd.is_some_and(|fd| fds.iter().any(|p| p.fd == fd && p.revents != 0));
+            let ready = |fd: Option<RawFd>| {
+                fd.is_some_and(|fd| fds.iter().any(|p| p.fd == fd && p.revents != 0))
+            };
             let wl_ready = fds.first().is_some_and(|p| p.revents != 0);
             let extra_ready = ready(extra);
             let paste_ready = ready(paste_fd);
             if wl_ready {
                 match guard.read() {
                     Ok(_) => {}
-                    Err(smithay_client_toolkit::reexports::client::backend::WaylandError::Io(e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(smithay_client_toolkit::reexports::client::backend::WaylandError::Io(
+                        e,
+                    )) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("wayland: {e}")),
                 }
             } else {
@@ -360,15 +378,21 @@ impl Ui {
 
     /// Render the current view into an RGBA buffer without a compositor
     /// (tests, `--render-png`).
-    pub fn render_offscreen(theme: Theme, fonts: Fonts, view: View, field: Field<'_>, scale: i32, size: f32) -> (u32, u32, Vec<u8>) {
+    pub fn render_offscreen(
+        theme: Theme,
+        fonts: Fonts,
+        view: View,
+        field: Field<'_>,
+        scale: i32,
+        size: f32,
+    ) -> (u32, u32, Vec<u8>) {
         let zoom = clamp_size(size);
-        let mut app_like = Offscreen {
-            theme,
-            fonts,
-            view,
-        };
+        let mut app_like = Offscreen { theme, fonts, view };
         let h = layout_height(&mut app_like.fonts, &app_like.view);
-        let (w, h) = (zoomed(W as f32, zoom) * scale as u32, zoomed(h, zoom) * scale as u32);
+        let (w, h) = (
+            zoomed(W as f32, zoom) * scale as u32,
+            zoomed(h, zoom) * scale as u32,
+        );
         let mut data = vec![0u8; (w * h * 4) as usize];
         {
             let mut c = Canvas {
@@ -376,7 +400,14 @@ impl Ui {
                 h: h as i32,
                 data: &mut data,
             };
-            paint(&mut c, &mut app_like.fonts, &app_like.theme, &app_like.view, field, scale as f32 * zoom);
+            paint(
+                &mut c,
+                &mut app_like.fonts,
+                &app_like.theme,
+                &app_like.view,
+                field,
+                scale as f32 * zoom,
+            );
         }
         (w, h, data)
     }
@@ -425,8 +456,16 @@ fn detail_lines(fonts: &mut Fonts, v: &View) -> Vec<(String, String, Tone)> {
             out.push((String::new(), String::new(), Tone::Muted));
             continue;
         }
-        for (i, line) in fonts.wrap_hard(false, value, DETAIL_PX, width).into_iter().enumerate() {
-            out.push((if i == 0 { label.clone() } else { String::new() }, line, *tone));
+        for (i, line) in fonts
+            .wrap_hard(false, value, DETAIL_PX, width)
+            .into_iter()
+            .enumerate()
+        {
+            out.push((
+                if i == 0 { label.clone() } else { String::new() },
+                line,
+                *tone,
+            ));
         }
     }
     out
@@ -472,7 +511,14 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
     let (w, h) = (c.w as f32, c.h as f32);
     // border + card
     c.round_rect(0.0, 0.0, w, h, 14.0 * s, t.accent);
-    c.round_rect(2.0 * s, 2.0 * s, w - 4.0 * s, h - 4.0 * s, 12.0 * s, t.background);
+    c.round_rect(
+        2.0 * s,
+        2.0 * s,
+        w - 4.0 * s,
+        h - 4.0 * s,
+        12.0 * s,
+        t.background,
+    );
     let inner = (W as f32 - 2.0 * PAD) * s;
     let x = PAD * s;
     let mut y = PAD * s + fonts.ascent(TITLE_PX * s);
@@ -490,7 +536,15 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
         y += ROW_H * s;
         c.text(fonts, false, x, y, BODY_PX * s, label, t.muted);
         let val = fonts.ellipsize(false, value, BODY_PX * s, inner - label_w);
-        c.text(fonts, false, x + label_w, y, BODY_PX * s, &val, tone(t, *tn));
+        c.text(
+            fonts,
+            false,
+            x + label_w,
+            y,
+            BODY_PX * s,
+            &val,
+            tone(t, *tn),
+        );
     }
     if v.show_details && !v.details.is_empty() {
         let lines = detail_lines(fonts, v);
@@ -508,11 +562,28 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
                 let l = fonts.ellipsize(false, label, DETAIL_PX * s, (DETAIL_LABEL_W - 6.0) * s);
                 c.text(fonts, false, lx, ly, DETAIL_PX * s, &l, t.muted);
             }
-            let val = fonts.ellipsize(false, value, DETAIL_PX * s, inner - (24.0 + DETAIL_LABEL_W) * s);
-            c.text(fonts, false, lx + DETAIL_LABEL_W * s, ly, DETAIL_PX * s, &val, tone(t, *tn));
+            let val = fonts.ellipsize(
+                false,
+                value,
+                DETAIL_PX * s,
+                inner - (24.0 + DETAIL_LABEL_W) * s,
+            );
+            c.text(
+                fonts,
+                false,
+                lx + DETAIL_LABEL_W * s,
+                ly,
+                DETAIL_PX * s,
+                &val,
+                tone(t, *tn),
+            );
         }
         let ind = if n > shown {
-            format!("lines {}–{} of {n}   ↑ ↓ PgUp PgDn scroll", first + 1, first + shown)
+            format!(
+                "lines {}–{} of {n}   ↑ ↓ PgUp PgDn scroll",
+                first + 1,
+                first + shown
+            )
         } else {
             format!("{n} lines")
         };
@@ -534,9 +605,25 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
         let top = y + 10.0 * s;
         c.round_rect(x, top, inner, 30.0 * s, 8.0 * s, t.selection);
         let by = top + 20.0 * s;
-        let lw = c.text(fonts, false, x + 12.0 * s, by, SMALL_PX * s, "your phrase  ", t.muted);
+        let lw = c.text(
+            fonts,
+            false,
+            x + 12.0 * s,
+            by,
+            SMALL_PX * s,
+            "your phrase  ",
+            t.muted,
+        );
         let ph = fonts.ellipsize(true, &v.phrase, BODY_PX * s, inner - lw - 24.0 * s);
-        c.text(fonts, true, x + 12.0 * s + lw, by, BODY_PX * s, &ph, t.foreground);
+        c.text(
+            fonts,
+            true,
+            x + 12.0 * s + lw,
+            by,
+            BODY_PX * s,
+            &ph,
+            t.foreground,
+        );
         y = top + 30.0 * s;
     }
     if let Some(label) = &v.field {
@@ -549,7 +636,14 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
             t.accent
         };
         c.round_rect(x, top, inner, 44.0 * s, 9.0 * s, edge);
-        c.round_rect(x + 1.5 * s, top + 1.5 * s, inner - 3.0 * s, 41.0 * s, 8.0 * s, t.surface);
+        c.round_rect(
+            x + 1.5 * s,
+            top + 1.5 * s,
+            inner - 3.0 * s,
+            41.0 * s,
+            8.0 * s,
+            t.surface,
+        );
         let by = top + 28.0 * s;
         let lw = c.text(fonts, false, x + 14.0 * s, by, BODY_PX * s, label, t.muted);
         let mut dx = x + 14.0 * s + lw + 10.0 * s;
@@ -558,14 +652,23 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
         if let Some(plain) = field.plain {
             // Scroll so the cursor stays in view, then draw what fits.
             let px = BODY_PX * s;
-            let at = plain.char_indices().nth(field.cursor).map_or(plain.len(), |(i, _)| i);
+            let at = plain
+                .char_indices()
+                .nth(field.cursor)
+                .map_or(plain.len(), |(i, _)| i);
             let mut start = 0;
-            while start < at && fonts.width_uncached(plain.get(start..at).unwrap_or(""), px) > room {
-                start += plain.get(start..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8);
+            while start < at && fonts.width_uncached(plain.get(start..at).unwrap_or(""), px) > room
+            {
+                start += plain
+                    .get(start..)
+                    .and_then(|r| r.chars().next())
+                    .map_or(1, char::len_utf8);
             }
             let mut end = at;
             while let Some(ch) = plain.get(end..).and_then(|r| r.chars().next()) {
-                if fonts.width_uncached(plain.get(start..end + ch.len_utf8()).unwrap_or(""), px) > room {
+                if fonts.width_uncached(plain.get(start..end + ch.len_utf8()).unwrap_or(""), px)
+                    > room
+                {
                     break;
                 }
                 end += ch.len_utf8();
@@ -584,27 +687,64 @@ fn paint(c: &mut Canvas<'_>, fonts: &mut Fonts, t: &Theme, v: &View, field: Fiel
             }
         }
         if !v.busy && field.focused {
-            c.round_rect(cursor_x.max(x + 14.0 * s + lw + 8.0 * s), by - 15.0 * s, 2.0 * s, 19.0 * s, 1.0 * s, t.accent);
+            c.round_rect(
+                cursor_x.max(x + 14.0 * s + lw + 8.0 * s),
+                by - 15.0 * s,
+                2.0 * s,
+                19.0 * s,
+                1.0 * s,
+                t.accent,
+            );
         }
         y = top + 44.0 * s;
         let keys = format!(
             "Ctrl+V paste    Ctrl+H {}    Ctrl+U clear    Ctrl+W delete word",
-            if field.plain.is_some() { "hide" } else { "show" }
+            if field.plain.is_some() {
+                "hide"
+            } else {
+                "show"
+            }
         );
         let (keys, kc) = if field.focused {
             (keys, t.muted)
         } else {
-            ("Typing goes to another window. Click here to type.".to_string(), t.yellow)
+            (
+                "Typing goes to another window. Click here to type.".to_string(),
+                t.yellow,
+            )
         };
         let kl = fonts.ellipsize(false, &keys, SMALL_PX * s, inner);
-        c.text(fonts, false, x + 4.0 * s, y + (FIELD_KEYS_H - 3.0) * s, SMALL_PX * s, &kl, kc);
+        c.text(
+            fonts,
+            false,
+            x + 4.0 * s,
+            y + (FIELD_KEYS_H - 3.0) * s,
+            SMALL_PX * s,
+            &kl,
+            kc,
+        );
         y += FIELD_KEYS_H * s;
     }
     for hint in &v.hints {
         y += ROW_H * s;
         let hl = fonts.ellipsize(false, hint, BODY_PX * s, inner - 22.0 * s);
-        c.round_rect(x + 2.0 * s, y - 9.0 * s, 8.0 * s, 8.0 * s, 4.0 * s, t.yellow);
-        c.text(fonts, false, x + 20.0 * s, y, BODY_PX * s, &hl, t.foreground);
+        c.round_rect(
+            x + 2.0 * s,
+            y - 9.0 * s,
+            8.0 * s,
+            8.0 * s,
+            4.0 * s,
+            t.yellow,
+        );
+        c.text(
+            fonts,
+            false,
+            x + 20.0 * s,
+            y,
+            BODY_PX * s,
+            &hl,
+            t.foreground,
+        );
     }
     y += (10.0 + ROW_H) * s;
     if let Some((m, tn)) = &v.message {
@@ -630,7 +770,10 @@ impl App {
         let s = self.scale.max(1);
         let (pw, ph) = (self.width as i32 * s, self.height as i32 * s);
         let stride = pw * 4;
-        let Ok((buffer, data)) = self.pool.create_buffer(pw, ph, stride, wl_shm::Format::Argb8888) else {
+        let Ok((buffer, data)) = self
+            .pool
+            .create_buffer(pw, ph, stride, wl_shm::Format::Argb8888)
+        else {
             return;
         };
         {
@@ -641,7 +784,14 @@ impl App {
                 plain: self.reveal.then_some(self.input.as_str()),
                 focused: self.focused,
             };
-            paint(&mut c, &mut self.fonts, &self.theme, &self.view, field, s as f32 * self.zoom);
+            paint(
+                &mut c,
+                &mut self.fonts,
+                &self.theme,
+                &self.view,
+                field,
+                s as f32 * self.zoom,
+            );
         }
         let surf = self.layer.wl_surface();
         surf.set_buffer_scale(s);
@@ -668,7 +818,10 @@ impl App {
         if self.view.field.is_none() || self.view.busy || self.paste.is_some() {
             return;
         }
-        let offer = self.data_device.as_ref().and_then(|d| d.data().selection_offer());
+        let offer = self
+            .data_device
+            .as_ref()
+            .and_then(|d| d.data().selection_offer());
         let Some(offer) = offer else {
             self.note("clipboard is empty", Tone::Warn);
             return;
@@ -750,7 +903,10 @@ impl App {
         };
         let n = text.chars().count();
         if !self.input.insert(text) {
-            self.note(&format!("too long to paste (max {MAX_INPUT} characters)"), Tone::Error);
+            self.note(
+                &format!("too long to paste (max {MAX_INPUT} characters)"),
+                Tone::Error,
+            );
             return;
         }
         self.note(&format!("pasted {n} characters"), Tone::Muted);
@@ -771,12 +927,20 @@ impl App {
             }
             Keysym::Up if self.view.show_details => self.scroll_by(-1),
             Keysym::Down if self.view.show_details => self.scroll_by(1),
-            Keysym::Page_Up if self.view.show_details => self.scroll_by(-(DETAIL_VISIBLE as isize - 2)),
-            Keysym::Page_Down if self.view.show_details => self.scroll_by(DETAIL_VISIBLE as isize - 2),
+            Keysym::Page_Up if self.view.show_details => {
+                self.scroll_by(-(DETAIL_VISIBLE as isize - 2))
+            }
+            Keysym::Page_Down if self.view.show_details => {
+                self.scroll_by(DETAIL_VISIBLE as isize - 2)
+            }
             // Home/End move the cursor when there's a field; then the
             // details use Ctrl+Home/Ctrl+End.
-            Keysym::Home if self.view.show_details && (self.ctrl || self.view.field.is_none()) => self.scroll_by(-100_000),
-            Keysym::End if self.view.show_details && (self.ctrl || self.view.field.is_none()) => self.scroll_by(100_000),
+            Keysym::Home if self.view.show_details && (self.ctrl || self.view.field.is_none()) => {
+                self.scroll_by(-100_000)
+            }
+            Keysym::End if self.view.show_details && (self.ctrl || self.view.field.is_none()) => {
+                self.scroll_by(100_000)
+            }
             Keysym::Return | Keysym::KP_Enter => {
                 if self.view.busy {
                     return;
@@ -789,7 +953,8 @@ impl App {
                     self.paste = None;
                     self.events.push_back(UiEvent::Submit(pin));
                 } else {
-                    self.events.push_back(UiEvent::Submit(Zeroizing::new(String::new())));
+                    self.events
+                        .push_back(UiEvent::Submit(Zeroizing::new(String::new())));
                 }
                 self.dirty = true;
             }
@@ -853,16 +1018,43 @@ impl App {
 }
 
 impl CompositorHandler for App {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, f: i32) {
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        f: i32,
+    ) {
         if f != self.scale {
             self.scale = f.clamp(1, 4);
             self.dirty = true;
         }
     }
-    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for App {
@@ -878,7 +1070,14 @@ impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         self.events.push_back(UiEvent::Closed);
     }
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &LayerSurface,
+        cfg: LayerSurfaceConfigure,
+        _: u32,
+    ) {
         if cfg.new_size.0 > 0 {
             self.width = cfg.new_size.0;
         }
@@ -895,15 +1094,30 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        cap: Capability,
+    ) {
         if cap == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
         }
         if cap == Capability::Keyboard && self.data_device.is_none() {
-            self.data_device = self.data_devices.as_ref().map(|m| m.get_data_device(qh, &seat));
+            self.data_device = self
+                .data_devices
+                .as_ref()
+                .map(|m| m.get_data_device(qh, &seat));
         }
     }
-    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        cap: Capability,
+    ) {
         if cap == Capability::Keyboard {
             if let Some(k) = self.keyboard.take() {
                 k.release();
@@ -914,14 +1128,30 @@ impl SeatHandler for App {
 }
 
 impl KeyboardHandler for App {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
         self.focused = true;
         // modifiers come in a separate event right after enter
         self.ctrl = false;
         self.shift = false;
         self.dirty = true;
     }
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
         // Focus went to another window: forget held modifiers (we won't see
         // them released). Never submit or deny because of this.
         self.focused = false;
@@ -929,19 +1159,57 @@ impl KeyboardHandler for App {
         self.shift = false;
         self.dirty = true;
     }
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        ev: KeyEvent,
+    ) {
         self.key(ev);
     }
-    fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        ev: KeyEvent,
+    ) {
         if matches!(
             ev.keysym,
-            Keysym::BackSpace | Keysym::Delete | Keysym::Left | Keysym::Right | Keysym::Up | Keysym::Down | Keysym::Page_Up | Keysym::Page_Down
+            Keysym::BackSpace
+                | Keysym::Delete
+                | Keysym::Left
+                | Keysym::Right
+                | Keysym::Up
+                | Keysym::Down
+                | Keysym::Page_Up
+                | Keysym::Page_Down
         ) {
             self.key(ev);
         }
     }
-    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, m: Modifiers, _: RawModifiers, _: u32) {
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        m: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
         self.ctrl = m.ctrl;
         self.shift = m.shift;
     }
@@ -949,7 +1217,16 @@ impl KeyboardHandler for App {
 
 // Only the clipboard selection is used; drag and drop is ignored.
 impl DataDeviceHandler for App {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {}
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataDevice,
+        _: f64,
+        _: f64,
+        _: &wl_surface::WlSurface,
+    ) {
+    }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
     fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
@@ -957,8 +1234,22 @@ impl DataDeviceHandler for App {
 }
 
 impl DataOfferHandler for App {
-    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
-    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+    fn source_actions(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+    fn selected_action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
 }
 
 impl ShmHandler for App {
@@ -998,7 +1289,10 @@ mod tests {
     #[test]
     fn mime_choice() {
         let m = |v: &[&str]| pick_mime(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(m(&["text/plain", "text/plain;charset=utf-8"]), Some("text/plain;charset=utf-8"));
+        assert_eq!(
+            m(&["text/plain", "text/plain;charset=utf-8"]),
+            Some("text/plain;charset=utf-8")
+        );
         assert_eq!(m(&["TEXT", "text/plain"]), Some("text/plain"));
         assert_eq!(m(&["UTF8_STRING"]), Some("UTF8_STRING"));
         assert_eq!(m(&["image/png"]), None);

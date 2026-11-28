@@ -150,8 +150,7 @@ impl Record {
 
     pub fn decode(s: &str) -> Result<Self> {
         let mut it = s.split_ascii_whitespace();
-        if it.next() != Some(MAGIC) || it.next() != Some(VERSION) || it.next() != Some("argon2id")
-        {
+        if it.next() != Some(MAGIC) || it.next() != Some(VERSION) || it.next() != Some("argon2id") {
             bail!("unrecognized PIN file");
         }
         let mut cost = Cost::default();
@@ -162,18 +161,27 @@ impl Record {
             let Some((k, v)) = field.split_once('=') else {
                 bail!("bad PIN file field");
             };
-            let num = || v.parse::<u32>().map_err(|_| Error::msg("bad PIN file number"));
+            let num = || {
+                v.parse::<u32>()
+                    .map_err(|_| Error::msg("bad PIN file number"))
+            };
             match k {
                 "m" => cost.m_kib = num()?,
                 "t" => cost.t = num()?,
                 "p" => cost.p = num()?,
                 "salt" => {
                     let b = B64.decode(v).map_err(|_| Error::msg("bad PIN salt"))?;
-                    salt = Some(<[u8; 16]>::try_from(b.as_slice()).map_err(|_| Error::msg("bad PIN salt"))?);
+                    salt = Some(
+                        <[u8; 16]>::try_from(b.as_slice())
+                            .map_err(|_| Error::msg("bad PIN salt"))?,
+                    );
                 }
                 "hash" => {
                     let b = B64.decode(v).map_err(|_| Error::msg("bad PIN hash"))?;
-                    hash = Some(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| Error::msg("bad PIN hash"))?);
+                    hash = Some(
+                        <[u8; 32]>::try_from(b.as_slice())
+                            .map_err(|_| Error::msg("bad PIN hash"))?,
+                    );
                 }
                 "phrase" => {
                     let b = B64.decode(v).map_err(|_| Error::msg("bad PIN phrase"))?;
@@ -266,7 +274,10 @@ mod tests {
     fn hmac_long_key() {
         // RFC 4231 test case 6: 131-byte key.
         let key = [0xaau8; 131];
-        let mac = hmac_sha256(&key, b"Test Using Larger Than Block-Size Key - Hash Key First");
+        let mac = hmac_sha256(
+            &key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
         let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,

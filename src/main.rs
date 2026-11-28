@@ -70,7 +70,14 @@ fn main() -> ExitCode {
             }
             match client::lock(forget) {
                 Ok(()) => {
-                    println!("{}", if forget { "forgotten (next unlock needs gpg)" } else { "locked" });
+                    println!(
+                        "{}",
+                        if forget {
+                            "forgotten (next unlock needs gpg)"
+                        } else {
+                            "locked"
+                        }
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(1, e),
@@ -217,7 +224,11 @@ fn print_status(st: &Status) {
         println!(
             "approval: {}{}",
             st.methods.join(", "),
-            if st.prompter { "; dialog connected" } else { "; no dialog connected" }
+            if st.prompter {
+                "; dialog connected"
+            } else {
+                "; no dialog connected"
+            }
         );
     }
     if let Some(s) = &st.session {
@@ -229,7 +240,11 @@ fn print_status(st: &Status) {
                 o.user,
                 o.pid,
                 server::sanitize(&o.command, 80),
-                if o.app.is_empty() { String::new() } else { format!(" in {}", o.app) },
+                if o.app.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {}", o.app)
+                },
                 if o.sandboxed { " [sandbox]" } else { "" }
             )
         };
@@ -484,7 +499,11 @@ fn daemon(args: &[String]) -> Result<()> {
     eprintln!(
         "secret-broker {VERSION}: {} profiles, secrets file {secrets_file}{}",
         srv.profile_count(),
-        if agent.is_some() { ", restricted socket for sandboxes" } else { "" }
+        if agent.is_some() {
+            ", restricted socket for sandboxes"
+        } else {
+            ""
+        }
     );
     srv.audit(
         secret_broker::audit::Event::new("broker_start", "ok")

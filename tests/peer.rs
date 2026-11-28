@@ -40,12 +40,27 @@ fn a_child_client_is_identified() {
     }
 
     let c = caller::collect_live(cred.pid);
-    assert!(c.exe.ends_with("/secret-broker"), "exe {:?} {:?}", c.exe, c.notes);
-    assert_eq!(c.argv.get(1).map(String::as_str), Some("status"), "{:?}", c.argv);
+    assert!(
+        c.exe.ends_with("/secret-broker"),
+        "exe {:?} {:?}",
+        c.exe,
+        c.notes
+    );
+    assert_eq!(
+        c.argv.get(1).map(String::as_str),
+        Some("status"),
+        "{:?}",
+        c.argv
+    );
     assert!(!c.cwd.is_empty(), "{:?}", c.notes);
     assert!(c.start_time > 0);
     let me = i32::try_from(sys::getpid()).unwrap();
-    assert_eq!(c.parents.first().map(|p| p.pid), Some(me), "{:?}", c.parents);
+    assert_eq!(
+        c.parents.first().map(|p| p.pid),
+        Some(me),
+        "{:?}",
+        c.parents
+    );
     assert_eq!(c.parents.first().map(|p| p.uid), Some(sys::getuid()));
     if let Some(p) = &pin {
         assert!(p.alive());

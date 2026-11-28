@@ -18,7 +18,9 @@ impl Fonts {
         let r = Font::from_bytes(regular, FontSettings::default()).map_err(|e| e.to_string())?;
         let b = match bold {
             Some(b) => Font::from_bytes(b, FontSettings::default()).map_err(|e| e.to_string())?,
-            None => Font::from_bytes(regular, FontSettings::default()).map_err(|e| e.to_string())?,
+            None => {
+                Font::from_bytes(regular, FontSettings::default()).map_err(|e| e.to_string())?
+            }
         };
         Ok(Fonts {
             regular: r,
@@ -38,11 +40,15 @@ impl Fonts {
     /// Advance width without touching the glyph cache, for revealed secret
     /// text (so the cache doesn't keep which characters a password uses).
     pub fn width_uncached(&self, text: &str, px: f32) -> f32 {
-        text.chars().map(|c| self.regular.metrics(c, px).advance_width).sum()
+        text.chars()
+            .map(|c| self.regular.metrics(c, px).advance_width)
+            .sum()
     }
 
     pub fn width(&mut self, bold: bool, text: &str, px: f32) -> f32 {
-        text.chars().map(|c| self.glyph(bold, c, px).0.advance_width).sum()
+        text.chars()
+            .map(|c| self.glyph(bold, c, px).0.advance_width)
+            .sum()
     }
 
     pub fn ascent(&self, px: f32) -> f32 {
@@ -106,7 +112,14 @@ impl Fonts {
     }
 
     /// Greedy word wrap into at most `max_lines` lines.
-    pub fn wrap(&mut self, bold: bool, text: &str, px: f32, max: f32, max_lines: usize) -> Vec<String> {
+    pub fn wrap(
+        &mut self,
+        bold: bool,
+        text: &str,
+        px: f32,
+        max: f32,
+        max_lines: usize,
+    ) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         for para in text.split('\n') {
             let mut cur = String::new();
@@ -162,7 +175,11 @@ impl Canvas<'_> {
         let a = a.min(1.0);
         let inv = 1.0 - a;
         // premultiplied: dst = src*a + dst*(1-a); bytes are B, G, R, A
-        let mix = |s: u8, d: u8| (f32::from(s) * a + f32::from(d) * inv).round().clamp(0.0, 255.0) as u8;
+        let mix = |s: u8, d: u8| {
+            (f32::from(s) * a + f32::from(d) * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
         if let [b, g, r, al] = px {
             *b = mix(c.2, *b);
             *g = mix(c.1, *g);
@@ -193,7 +210,16 @@ impl Canvas<'_> {
 
     /// Draw text with its baseline at `y`; returns the advance.
     #[allow(clippy::too_many_arguments)]
-    pub fn text(&mut self, fonts: &mut Fonts, bold: bool, x: f32, y: f32, px: f32, s: &str, c: Rgb) -> f32 {
+    pub fn text(
+        &mut self,
+        fonts: &mut Fonts,
+        bold: bool,
+        x: f32,
+        y: f32,
+        px: f32,
+        s: &str,
+        c: Rgb,
+    ) -> f32 {
         let mut pen = x;
         for ch in s.chars() {
             let (m, bitmap) = {

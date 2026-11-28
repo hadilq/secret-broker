@@ -37,11 +37,18 @@ impl Default for Theme {
 }
 
 pub fn parse_hex(s: &str) -> Option<Rgb> {
-    let h = s.trim().trim_matches('"').trim_matches('\'').strip_prefix('#')?;
+    let h = s
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .strip_prefix('#')?;
     if h.len() != 6 || !h.is_ascii() {
         return None;
     }
-    let byte = |i: usize| h.get(i..i.checked_add(2)?).and_then(|b| u8::from_str_radix(b, 16).ok());
+    let byte = |i: usize| {
+        h.get(i..i.checked_add(2)?)
+            .and_then(|b| u8::from_str_radix(b, 16).ok())
+    };
     Some(Rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
@@ -60,9 +67,13 @@ pub fn parse(text: &str) -> Theme {
             get.insert(k.trim().to_string(), c);
         }
     }
-    let pick = |names: &[&str], d: Rgb| names.iter().find_map(|n| get.get(*n).copied()).unwrap_or(d);
+    let pick =
+        |names: &[&str], d: Rgb| names.iter().find_map(|n| get.get(*n).copied()).unwrap_or(d);
     t.background = pick(&["background"], t.background);
-    t.surface = pick(&["lighter_background", "color0", "selection_background"], t.surface);
+    t.surface = pick(
+        &["lighter_background", "color0", "selection_background"],
+        t.surface,
+    );
     t.foreground = pick(&["foreground", "bright_foreground"], t.foreground);
     t.muted = pick(&["dark_foreground", "muted", "color8"], t.muted);
     t.accent = pick(&["accent", "color4", "cursor"], t.accent);
@@ -111,7 +122,8 @@ mod tests {
 
     #[test]
     fn parses_omarchy_colors() {
-        let t = parse("accent = \"#112233\"\nbackground = \"#000000\"\nnope = 3\nred=\"#ff0000\"\n");
+        let t =
+            parse("accent = \"#112233\"\nbackground = \"#000000\"\nnope = 3\nred=\"#ff0000\"\n");
         assert_eq!(t.accent, Rgb(0x11, 0x22, 0x33));
         assert_eq!(t.background, Rgb(0, 0, 0));
         assert_eq!(t.red, Rgb(0xff, 0, 0));

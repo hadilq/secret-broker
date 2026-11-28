@@ -50,7 +50,11 @@ pub struct Opts {
 #[cfg(target_os = "linux")]
 impl Opts {
     pub fn size(&self) -> f32 {
-        let env = || std::env::var("SECRET_BROKER_DIALOG_SIZE").ok().and_then(|v| v.trim().parse().ok());
+        let env = || {
+            std::env::var("SECRET_BROKER_DIALOG_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        };
         ui::clamp_size(self.size.or_else(env).unwrap_or(ui::DEFAULT_SIZE))
     }
 }
@@ -223,7 +227,11 @@ fn demo(o: &Opts, args: &[String]) -> Result<(), String> {
         }
     }
     // A made-up value, only for the screenshot of the revealed field.
-    let sample = if pin_mode { "correct horse battery" } else { "424242" };
+    let sample = if pin_mode {
+        "correct horse battery"
+    } else {
+        "424242"
+    };
     let field = ui::Field {
         len: sample.chars().count(),
         cursor: cursor.unwrap_or(usize::MAX).min(sample.chars().count()),
@@ -253,7 +261,9 @@ fn main() -> ExitCode {
     let _ = secret_broker::sys::disable_core_dumps();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mode, rest) = match args.first().map(String::as_str) {
-        Some(m @ ("prompter" | "pinentry" | "demo")) => (m.to_string(), args.get(1..).unwrap_or(&[]).to_vec()),
+        Some(m @ ("prompter" | "pinentry" | "demo")) => {
+            (m.to_string(), args.get(1..).unwrap_or(&[]).to_vec())
+        }
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;

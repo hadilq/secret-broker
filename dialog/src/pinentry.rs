@@ -66,11 +66,19 @@ fn wayland_available() -> bool {
 
 fn view(st: &St, prompt: &str, error: &str, field: bool, footer: &str) -> View {
     View {
-        title: if st.title.is_empty() { "Unlock".into() } else { st.title.clone() },
+        title: if st.title.is_empty() {
+            "Unlock".into()
+        } else {
+            st.title.clone()
+        },
         body: st.desc.clone(),
         field: field.then(|| {
             let p = prompt.trim().trim_end_matches(':').trim();
-            if p.is_empty() { "Passphrase".to_string() } else { p.to_string() }
+            if p.is_empty() {
+                "Passphrase".to_string()
+            } else {
+                p.to_string()
+            }
         }),
         message: (!error.is_empty()).then(|| (error.to_string(), Tone::Error)),
         footer: footer.into(),
@@ -103,7 +111,11 @@ fn ask(opts: &Opts, v: View) -> Result<Option<Zeroizing<String>>, String> {
 fn getpin(opts: &Opts, st: &St) -> Result<Option<(Zeroizing<String>, bool)>, String> {
     let mut error = st.error.clone();
     loop {
-        let Some(a) = ask(opts, view(st, &st.prompt, &error, true, "Enter  OK      Esc  cancel"))? else {
+        let Some(a) = ask(
+            opts,
+            view(st, &st.prompt, &error, true, "Enter  OK      Esc  cancel"),
+        )?
+        else {
             return Ok(None);
         };
         let Some(rp) = &st.repeat else {
@@ -212,7 +224,11 @@ pub fn run(opts: &Opts, argv: &[String]) -> std::process::ExitCode {
             }
             "CONFIRM" | "MESSAGE" => {
                 let one = cmd.eq_ignore_ascii_case("MESSAGE") || arg.contains("--one-button");
-                let footer = if one { "Enter  OK" } else { "Enter  OK      Esc  cancel" };
+                let footer = if one {
+                    "Enter  OK"
+                } else {
+                    "Enter  OK      Esc  cancel"
+                };
                 let err = std::mem::take(&mut st.error);
                 match ask(opts, view(&st, "", &err, false, footer)) {
                     Ok(Some(_)) => "OK".into(),
@@ -245,7 +261,10 @@ mod tests {
 
     #[test]
     fn assuan_escaping() {
-        assert_eq!(unescape("Please enter%0Athe passphrase%25 %zz"), "Please enter\nthe passphrase% %zz");
+        assert_eq!(
+            unescape("Please enter%0Athe passphrase%25 %zz"),
+            "Please enter\nthe passphrase% %zz"
+        );
         assert_eq!(escape("a%b\nc\r"), "a%25b%0Ac%0D");
         assert_eq!(unescape(&escape("x%y\nz")), "x%y\nz");
     }
