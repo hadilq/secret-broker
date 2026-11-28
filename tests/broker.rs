@@ -12,6 +12,7 @@
     clippy::unwrap_in_result
 )]
 
+use secret_broker::policy::CLIENT_DENY;
 use secret_broker::proto::{self, Answer, Prompt, Request, Response, Status};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -450,9 +451,11 @@ fn deny_tokens_refuse_exec_even_with_globstar_allow() {
     let ok = exec_profile(&agent, "gh", &["pr", "list"]);
     assert!(ok.is_ok(), "{ok:?}");
     let e = exec_profile(&agent, "gh", &["pr", "list", "--hostname", "evil.com"]).unwrap_err();
-    assert!(e.contains("is denied"), "{e}");
+    assert_eq!(e, CLIENT_DENY, "{e}");
+    assert!(!e.contains("evil.com") && !e.contains("--hostname"), "{e}");
     let e = exec_profile(&agent, "gh", &["pr", "list", "--debug"]).unwrap_err();
-    assert!(e.contains("is denied"), "{e}");
+    assert_eq!(e, CLIENT_DENY, "{e}");
+    assert!(!e.contains("--debug"), "{e}");
 }
 
 #[test]
