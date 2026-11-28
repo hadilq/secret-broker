@@ -127,6 +127,8 @@ let
         note(m)
         if m["kind"] == "request":
             rid = m["id"]
+            # Hardware (FIDO2/PAM) is armed only after the UI is showing.
+            wf(s, b"J", json.dumps({"kind": "ready", "id": rid}).encode())
             if mode == "pin":
                 for i, pin in enumerate(arg.split(",")):
                     if i > 1:
@@ -414,7 +416,11 @@ in
         machine.succeed(h("ai-run -- touch ~/dev/ok"))
         machine.fail(h("ai-run -- touch ~/.bashrc"))
         machine.fail(h("ai-run -- touch ~/.config/x"))
-        machine.fail(h("ai-run -- sh -c 'echo x > /run/docker.sock'"))
+        # tmpfs /run: not the host docker socket. A write only hits the tmpfs.
+        machine.succeed(h("ai-run -- test ! -S /run/docker.sock"))
+        machine.succeed(h("ai-run -- test ! -e /run/dbus/system_bus_socket"))
+        machine.succeed(h("ai-run -- sh -c 'echo leaked > /run/docker.sock'"))
+        machine.succeed("test ! -s /run/docker.sock")
         assert "GH_TOKEN=leak" in machine.succeed(h("GH_TOKEN=leak env"))
         assert "GH_TOKEN" not in machine.succeed(h("GH_TOKEN=leak ai-run -- env"))
         bpid = machine.succeed("systemctl show -p MainPID --value secret-broker").strip()
@@ -509,6 +515,10 @@ in
         out = machine.fail(h("ai-run -- secret-run demo hash 2>&1"))
         assert "denied" in out, out
         assert "sealed" in machine.succeed(h("secret-broker status"))
+        # deny cooldown: a follow-up is refused without opening a dialog
+        out = machine.fail(h("ai-run -- secret-run demo hash 2>&1"))
+        assert "denied recently" in out, out
+        machine.sleep(4)
 
     with subtest("security key (mock FIDO2) touch"):
         machine.succeed("rm -rf /run/fido2-mock && install -d -m 755 /run/fido2-mock")

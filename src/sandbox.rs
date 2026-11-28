@@ -212,19 +212,15 @@ const BROKER_SOCK: &[&str] = &[
 ];
 const AGENT_SOCK: &str = "/run/secret-broker/agent.sock";
 const BROKER_DIR: &[&str] = &["/run/secret-broker", "/var/run/secret-broker"];
-/// Host `/run` is parked here, then `/tmp` is replaced so the copy is gone
-/// before the command starts. Binds of paths under `/run` must use this
-/// source: after `--tmpfs /run` the original paths are not visible to bwrap.
-const HOST_RUN: &str = "/tmp/.ai-run-host-run";
 
-fn host_run_src(p: &Path) -> PathBuf {
-    if let Ok(rest) = p.strip_prefix("/run") {
-        return Path::new(HOST_RUN).join(rest);
+/// bwrap opens bind *sources* on the host, even after `--tmpfs` on the dest.
+/// Symlinks under `/run` (NixOS `current-system`) cannot be bind-mounted;
+/// use the canonical store path instead.
+fn run_bind_src(fs: &dyn Probe, dest: &Path) -> PathBuf {
+    match fs.resolve(dest) {
+        Some(r) if !(r.starts_with("/run") || r.starts_with("/var/run")) => r,
+        _ => dest.to_path_buf(),
     }
-    if let Ok(rest) = p.strip_prefix("/var/run") {
-        return Path::new(HOST_RUN).join(rest);
-    }
-    p.to_path_buf()
 }
 
 fn is_broker_sock(p: &Path) -> bool {
@@ -284,12 +280,8 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
 
     // Hide /run (docker.sock, system bus, pcscd, libvirt, ...). A bind of
     // /dev/null over those sockets drops when the daemon restarts and creates
-    // a new inode; a tmpfs on /run does not. `--ro-bind / /` makes /tmp
-    // read-only, so park host /run on a fresh tmpfs, then tmpfs /run, then
-    // bind only the paths we need from the copy. Overlaying /tmp later hides
-    // that copy.
-    push(&["--tmpfs", "/tmp"]);
-    push(&["--ro-bind-try", "/run", HOST_RUN]);
+    // a new inode; a tmpfs on /run does not. bwrap still opens bind sources
+    // on the host, so agent.sock / current-system are rebound from there.
     push(&["--tmpfs", "/run"]);
     if fs
         .resolve(Path::new("/var/run"))
@@ -297,22 +289,13 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
     {
         push(&["--tmpfs", "/var/run"]);
     }
-    push(&[
-        "--ro-bind-try",
-        &format!("{HOST_RUN}/current-system"),
-        "/run/current-system",
-    ]);
+    let cs = s(&run_bind_src(fs, Path::new("/run/current-system")));
+    push(&["--ro-bind-try", &cs, "/run/current-system"]);
     if prof.gui {
-        push(&[
-            "--ro-bind-try",
-            &format!("{HOST_RUN}/opengl-driver"),
-            "/run/opengl-driver",
-        ]);
-        push(&[
-            "--ro-bind-try",
-            &format!("{HOST_RUN}/opengl-driver-32"),
-            "/run/opengl-driver-32",
-        ]);
+        let gl = s(&run_bind_src(fs, Path::new("/run/opengl-driver")));
+        let gl32 = s(&run_bind_src(fs, Path::new("/run/opengl-driver-32")));
+        push(&["--ro-bind-try", &gl, "/run/opengl-driver"]);
+        push(&["--ro-bind-try", &gl32, "/run/opengl-driver-32"]);
     }
 
     // Hide the full broker socket even if it appears after we start: a tmpfs
@@ -328,8 +311,7 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
         push(&["--tmpfs", d]);
         push(&["--ro-bind-try", "/dev/null", sock]);
     }
-    let agent_src = s(&host_run_src(Path::new(AGENT_SOCK)));
-    push(&["--bind-try", &agent_src, AGENT_SOCK]);
+    push(&["--bind-try", AGENT_SOCK, AGENT_SOCK]);
 
     // /tmp: per-profile, shared by that profile's instances (Electron's
     // single-instance socket lives there), never the host's.
@@ -367,14 +349,14 @@ pub fn plan(cfg: &Config, name: &str, ctx: &Ctx, fs: &dyn Probe) -> Result<Plan>
             }
         }
         for e in expose {
-            a.extend(["--ro-bind-try".into(), s(&host_run_src(&e)), s(&e)]);
+            a.extend(["--ro-bind-try".into(), s(&e), s(&e)]);
         }
         if let Some(d) = &prof.dbus {
             let dir = base.join(format!("proxy-{}", std::process::id()));
             let sock = dir.join("bus");
             p.create_dirs.push(dir);
             let inner = rt.join("bus");
-            a.extend(["--ro-bind".into(), s(&host_run_src(&sock)), s(&inner)]);
+            a.extend(["--ro-bind".into(), s(&sock), s(&inner)]);
             p.env.push((
                 "DBUS_SESSION_BUS_ADDRESS".into(),
                 format!("unix:path={}", s(&inner)),
@@ -622,6 +604,16 @@ mod tests {
             ("/home/u/.local/share/acct", Kind::Dir),
         ])
         .link("/home/u/.hm-link", "/nix/store/abc-file", Kind::Other)
+        .link(
+            "/run/current-system",
+            "/nix/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-nixos-system",
+            Kind::Dir,
+        )
+        .link(
+            "/run/opengl-driver",
+            "/nix/store/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy-mesa",
+            Kind::Dir,
+        )
     }
 
     fn has(args: &[String], seq: &[&str]) -> bool {
@@ -640,36 +632,17 @@ mod tests {
         let p = plan(&cfg(), "default", &ctx(), &fs()).unwrap();
         let a = &p.args;
         assert!(has(a, &["--ro-bind", "/", "/"]));
-        assert!(has(a, &["--tmpfs", "/tmp"]));
-        assert!(has(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"]));
-        assert!(
-            pos(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"])
-                > pos(a, &["--tmpfs", "/tmp"])
-        );
         assert!(has(a, &["--tmpfs", "/run"]));
-        assert!(
-            pos(a, &["--tmpfs", "/run"])
-                > pos(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"])
-        );
+        assert!(pos(a, &["--tmpfs", "/run"]) > pos(a, &["--ro-bind", "/", "/"]));
         assert!(has(a, &["--tmpfs", "/run/secret-broker"]));
         assert!(has(
             a,
             &[
                 "--bind-try",
-                "/tmp/.ai-run-host-run/secret-broker/agent.sock",
+                "/run/secret-broker/agent.sock",
                 "/run/secret-broker/agent.sock"
             ]
         ));
-        assert!(
-            pos(
-                a,
-                &[
-                    "--bind",
-                    "/run/user/1000/ai-run/default/tmp",
-                    "/tmp"
-                ]
-            ) > pos(a, &["--tmpfs", "/run"])
-        );
         assert!(has(
             a,
             &[
@@ -696,7 +669,7 @@ mod tests {
             a,
             &[
                 "--ro-bind-try",
-                "/tmp/.ai-run-host-run/current-system",
+                "/nix/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-nixos-system",
                 "/run/current-system"
             ]
         ));
@@ -767,12 +740,23 @@ mod tests {
         assert!(!a.iter().any(|x| x == "/run/docker.sock"));
         assert!(!a.iter().any(|x| x == "/run/dbus/system_bus_socket"));
         assert!(!a.iter().any(|x| x == "/var/run/docker.sock"));
-        assert!(has(a, &["--ro-bind-try", "/run", "/tmp/.ai-run-host-run"]));
+        // no current-system symlink here: still try the dest (NixOS binds
+        // the canonical store path; see default_profile_masks_and_isolates).
+        assert!(has(
+            a,
+            &[
+                "--ro-bind-try",
+                "/run/current-system",
+                "/run/current-system"
+            ]
+        ));
+        // tmpfs /run is writable, so a sandbox write must not bind the host
+        // socket (that would be --bind of the host path as dest).
         assert!(has(
             a,
             &[
                 "--bind-try",
-                "/tmp/.ai-run-host-run/secret-broker/agent.sock",
+                "/run/secret-broker/agent.sock",
                 "/run/secret-broker/agent.sock"
             ]
         ));
@@ -798,7 +782,7 @@ mod tests {
             a,
             &[
                 "--ro-bind-try",
-                "/tmp/.ai-run-host-run/user/1000/wayland-1",
+                "/run/user/1000/wayland-1",
                 "/run/user/1000/wayland-1"
             ]
         ));
@@ -808,7 +792,7 @@ mod tests {
             a,
             &[
                 "--ro-bind-try",
-                "/tmp/.ai-run-host-run/opengl-driver",
+                "/nix/store/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy-mesa",
                 "/run/opengl-driver"
             ]
         ));
@@ -822,7 +806,7 @@ mod tests {
             a,
             &[
                 "--ro-bind",
-                &host_run_src(&sock).to_string_lossy(),
+                &sock.to_string_lossy(),
                 "/run/user/1000/bus"
             ]
         ));
